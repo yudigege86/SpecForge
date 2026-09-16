@@ -1,0 +1,256 @@
+"""Built-in linear-context DFlash registration and executable providers.
+
+Reuses DFlash target-feature capture, sampled-anchor training, and the frozen
+LM head. The draft architecture is ``DFlashLinearDraftModel`` so later work can
+replace context KV without touching stock DFlash.
+"""
+
+from __future__ import annotations
+
+from functools import partial
+
+from specforge.algorithms.common.defaults import (
+    empty_options,
+    no_missing_checkpoint_keys,
+)
+from specforge.algorithms.common.hidden_states_data import (
+    NORMALIZER_ID,
+    build_collator,
+    build_offline_normalizer,
+    build_offline_reader,
+)
+from specforge.algorithms.common.providers import (
+    AlgorithmProviders,
+    DraftConfigProvider,
+    ModelProvider,
+    OfflineCaptureLayout,
+    OfflineDataProvider,
+    ServerCaptureLayout,
+    ServerStreamingProvider,
+    StepProvider,
+    TargetDerivedDraftDefaults,
+    make_registration,
+)
+from specforge.algorithms.contracts import (
+    AlgorithmCapabilities,
+    AlgorithmSpec,
+    DraftRequirement,
+    FeatureContract,
+    FeatureMode,
+    OfflineStorageContract,
+)
+from specforge.data.loss_mask import has_consecutive_supervised_tokens
+
+ALGORITHM_NAME = "dflash_linear"
+DRAFT_ARCHITECTURE = "DFlashLinearDraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE})
+_RESUME_PREFIXES = ("dflash2_", "dflash_")
+
+
+def build_step(wrapped_model, *, target_head=None, **_options):
+    del target_head
+    from specforge.training.strategies.base import DFlashTrainStrategy
+
+    return DFlashTrainStrategy(wrapped_model)
+
+
+def resume_contract(config, draft_model, training_model):
+    """Persist DFlash sampling/loss semantics under the dflash_linear prefix."""
+
+    from specforge.algorithms.dflash.providers import (
+        resume_contract as dflash_resume_contract,
+    )
+
+    contract = dflash_resume_contract(config, draft_model, training_model)
+    renamed = {}
+    for key, value in contract.items():
+        suffix = None
+        for prefix in _RESUME_PREFIXES:
+            if key.startswith(prefix):
+                suffix = key[len(prefix) :]
+                break
+        if suffix is None:
+            raise ValueError(f"unexpected DFlash resume key {key!r}")
+        renamed[f"{ALGORITHM_NAME}_{suffix}"] = value
+    return renamed
+
+
+def resolve_dflash_kernels(config):
+    if not config.model.use_liger_kernel:
+        return None
+
+    from specforge.modeling.draft.dflash_kernels import load_liger_dflash_kernels
+
+    return load_liger_dflash_kernels()
+
+
+def build_draft(config, draft_config):
+    from specforge.algorithms.model_providers import build_dflash_draft
+
+    return build_dflash_draft(
+        config,
+        draft_config,
+        resolve_dflash_kernels(config),
+    )
+
+
+def build_training_model(config, draft_model, draft_config, target_config, tokenizer):
+    from specforge.algorithms.dflash_linear.model import OnlineDFlashLinearModel
+    from specforge.algorithms.model_providers import _build_dflash_family_model
+
+    del draft_config, target_config
+    return _build_dflash_family_model(
+        config,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineDFlashLinearModel(
+            **common,
+            loss_type=config.training.loss_type,
+            dpace_alpha=config.training.dpace_alpha,
+            selector_loss_alpha=config.training.dflash2_selector_loss_alpha,
+            selector_warmup_ratio=config.training.dflash2_selector_warmup_ratio,
+            selector_ramp_ratio=config.training.dflash2_selector_ramp_ratio,
+            selector_stop_gradient=config.training.dflash2_selector_stop_gradient,
+            lk_loss_type=config.training.lk_loss_type,
+            kl_scale=config.training.kl_scale,
+            kl_decay=config.training.kl_decay,
+        ),
+    )
+
+
+def resolve_capture_layers(config, draft_config, target_config):
+    from specforge.algorithms.model_providers import resolve_dflash_capture_layers
+
+    return resolve_dflash_capture_layers(config, draft_config, target_config)
+
+
+def populate_target_defaults(payload, target_config, config):
+    from specforge.algorithms.model_providers import populate_dflash_generated_config
+
+    return populate_dflash_generated_config(payload, target_config, config)
+
+
+def apply_draft_overrides(config, draft_config):
+    from specforge.algorithms.model_providers import apply_dflash_overrides
+
+    return apply_dflash_overrides(config, draft_config)
+
+
+def minimum_loss_tokens(config, draft_config):
+    from specforge.algorithms.model_providers import dflash_min_loss_tokens
+
+    return dflash_min_loss_tokens(config, draft_config)
+
+
+def needs_input_tools(config, draft_model):
+    from specforge.algorithms.model_providers import dflash_needs_input_tools
+
+    return dflash_needs_input_tools(config, draft_model)
+
+
+def algorithm_spec() -> AlgorithmSpec:
+    ready = {"input_ids", "loss_mask", "hidden_states"}
+    return AlgorithmSpec(
+        name=ALGORITHM_NAME,
+        draft=DraftRequirement(
+            compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
+            default_architecture=DRAFT_ARCHITECTURE,
+            supported_overrides={"num_hidden_layers", "block_size"},
+        ),
+        feature_contracts=(
+            FeatureContract(
+                mode=FeatureMode.OFFLINE,
+                modality="text",
+                required_tensors=ready,
+                storage=OfflineStorageContract(
+                    format="specforge_hidden_states_v1",
+                    required_tensors=ready,
+                    normalizer=NORMALIZER_ID,
+                ),
+            ),
+            FeatureContract(
+                mode=FeatureMode.STREAMING,
+                modality="text",
+                required_tensors=ready,
+            ),
+        ),
+        capabilities=AlgorithmCapabilities(
+            attention_backends={"eager", "sdpa", "flex_attention"},
+        ),
+    )
+
+
+def algorithm_providers() -> AlgorithmProviders:
+    collator = build_collator
+    return AlgorithmProviders(
+        algorithm_name=ALGORITHM_NAME,
+        step=StepProvider(
+            build=build_step,
+            options=empty_options,
+            resume_contract=resume_contract,
+            allowed_missing_checkpoint_keys=no_missing_checkpoint_keys,
+            uses_external_target_head=False,
+        ),
+        model=ModelProvider(
+            draft_config=DraftConfigProvider(
+                architecture=DRAFT_ARCHITECTURE,
+                compatible_architectures=COMPATIBLE_DRAFT_ARCHITECTURES,
+                expected_auto_map_model="dflash_linear.DFlashLinearDraftModel",
+                target_defaults=TargetDerivedDraftDefaults(
+                    model_type="qwen3",
+                    num_hidden_layers=1,
+                    populate=populate_target_defaults,
+                ),
+                apply_overrides=apply_draft_overrides,
+            ),
+            build_draft=build_draft,
+            build_training_model=build_training_model,
+            resolve_capture_layers=resolve_capture_layers,
+            minimum_loss_tokens=minimum_loss_tokens,
+            needs_input_tools=needs_input_tools,
+            default_dataloader_num_workers=8,
+            loss_mask_filter=has_consecutive_supervised_tokens,
+        ),
+        offline=(
+            OfflineDataProvider(
+                modality="text",
+                normalizer_id=NORMALIZER_ID,
+                capture_layout=OfflineCaptureLayout(
+                    # Share DFlash hidden-state caches; only the draft changes.
+                    capture_method="dflash",
+                    aux_feature="hidden_states",
+                    last_hidden_feature=None,
+                    passthrough=(
+                        ("input_ids", "input_ids"),
+                        ("loss_mask", "loss_mask"),
+                    ),
+                ),
+                build_reader=partial(build_offline_reader, ALGORITHM_NAME),
+                build_normalizer=build_offline_normalizer,
+                build_collator=collator,
+            ),
+        ),
+        server_streaming=(
+            ServerStreamingProvider(
+                modality="text",
+                capture_method="dflash",
+                target_representation=None,
+                layout=ServerCaptureLayout(
+                    aux_feature="hidden_states",
+                    last_hidden_feature="target_last_hidden_states",
+                    passthrough=(
+                        ("input_ids", "input_ids", ()),
+                        ("loss_mask", "loss_mask", ()),
+                    ),
+                ),
+                build_collator=collator,
+            ),
+        ),
+    )
+
+
+def create_registration():
+    return make_registration(algorithm_spec(), algorithm_providers())
+
+
+__all__ = ["algorithm_providers", "algorithm_spec", "create_registration"]

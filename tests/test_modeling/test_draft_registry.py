@@ -21,6 +21,7 @@ from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlash2DraftModel,
     DFlashDraftModel,
+    DFlashLinearDraftModel,
     DominoDraftModel,
     DSparkDraftModel,
     LlamaForCausalLMEagle3,
@@ -71,6 +72,12 @@ TINY_DSPARK = {
     },
 }
 
+TINY_DFLASH_LINEAR = {
+    **TINY_DFLASH,
+    "architectures": ["DFlashLinearDraftModel"],
+    "layer_types": ["full_attention"],
+}
+
 TINY_DFLASH2 = {
     **TINY_DFLASH,
     "architectures": ["DFlash2DraftModel"],
@@ -111,11 +118,13 @@ class DraftRegistryTest(unittest.TestCase):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DFlash2DraftModel", available_drafts())
+        self.assertIn("DFlashLinearDraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DFlash2DraftModel"), DFlash2DraftModel)
+        self.assertIs(resolve_draft("DFlashLinearDraftModel"), DFlashLinearDraftModel)
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
         self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
 
@@ -174,6 +183,18 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertEqual(model.projector_type, "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
+
+    def test_from_config_builds_dflash_linear_as_dflash_subclass(self):
+        path = _write(TINY_DFLASH_LINEAR)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoDraftModel.from_config(config)
+        self.assertIsInstance(model, DFlashLinearDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.block_size, 4)
+        from specforge.modeling.draft.dflash_linear import DFlashLinearDecoderLayer
+
+        self.assertIsInstance(model.layers[0], DFlashLinearDecoderLayer)
 
     def test_from_config_builds_dflash2_as_dflash_variant(self):
         path = _write(TINY_DFLASH2)

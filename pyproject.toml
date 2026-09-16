@@ -45,6 +45,10 @@ dev = [
 ]
 fa = ["flash-attn", "ninja", "packaging"]
 liger = ["liger-kernel"]
+# ROCm: image torch stays; do not reinstall torch from the PyTorch wheel index.
+#   pip install flash-linear-attention[rocm]
+# See https://github.com/fla-org/flash-linear-attention#installation
+fla = ["einops", "flash-linear-attention"]
 
 [tool.setuptools.dynamic]
 version = {file = "version.txt"}

@@ -22,7 +22,15 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = (
+    "dflash",
+    "dflash_linear",
+    "domino",
+    "dspark",
+    "eagle3",
+    "mtp",
+    "peagle",
+)
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -56,7 +64,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(contract_keys, provider_keys)
 
     def test_dflash_family_requires_a_trainable_block_size(self):
-        for algorithm in ("dflash", "domino", "dspark"):
+        for algorithm in ("dflash", "dflash_linear", "domino", "dspark"):
             minimum_loss_tokens = self.registry.resolve(
                 algorithm
             ).providers.model.minimum_loss_tokens
@@ -210,6 +218,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 mask_token_id=31,
             ),
             "dflash": dflash_family,
+            "dflash_linear": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
             "mtp": SimpleNamespace(),
@@ -237,6 +246,15 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dflash_lk_loss_type",
                 "dflash_kl_scale",
                 "dflash_kl_decay",
+            },
+            "dflash_linear": {
+                "dflash_linear_block_size",
+                "dflash_linear_num_anchors",
+                "dflash_linear_loss_type",
+                "dflash_linear_dpace_alpha",
+                "dflash_linear_lk_loss_type",
+                "dflash_linear_kl_scale",
+                "dflash_linear_kl_decay",
             },
             "domino": {
                 "domino_block_size",
@@ -443,7 +461,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )
