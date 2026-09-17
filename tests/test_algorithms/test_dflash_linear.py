@@ -125,13 +125,10 @@ class DFlashLinearRegistrationTest(unittest.TestCase):
                 self.assertEqual(linear_context[key], value, msg=f"{name}.{key}")
 
     def test_training_model_uses_independent_block_wrapper(self):
-        import inspect
-
         from specforge.algorithms.dflash_linear.providers import build_training_model
 
-        source = inspect.getsource(build_training_model)
-        self.assertIn("OnlineDFlashLinearModel", source)
-        self.assertNotIn("return build_dflash_model", source)
+        self.assertIn("OnlineDFlashLinearModel", build_training_model.__code__.co_names)
+        self.assertNotIn("build_dflash_model", build_training_model.__code__.co_names)
 
     def test_stock_qwen35_4b_dflash_recipe_is_unchanged(self):
         self.assertEqual(_yaml_scalar(STOCK_DFLASH_RECIPE, "strategy"), "dflash")

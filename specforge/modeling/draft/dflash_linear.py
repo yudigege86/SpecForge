@@ -185,7 +185,13 @@ class BlockLocalAttention(nn.Module):
 
 
 class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
-    """GDN/KDA prefix read, configurable injection, then dense B×B mixing."""
+    """GDN/KDA prefix read, configurable injection, then dense B×B mixing.
+
+    Layer-1 noise tokens are ``[anchor | MASK…]``, so identical MASK embeddings
+    would otherwise issue the same context query. A learned per-offset horizon
+    embedding is added only on the retrieve path; local B×B mixing still sees
+    the unmodified block tokens.
+    """
 
     def __init__(
         self,
@@ -222,6 +228,7 @@ class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
             int(self.settings["num_heads"]) * int(self.settings["key_dim"]),
             bias=False,
         )
+        self.horizon_embed = nn.Embedding(self.block_size, config.hidden_size)
         self.context_read_proj = nn.Linear(recurrent_out, config.hidden_size, bias=False)
         if self.settings["injection"] == "gated_residual":
             self.inject_gate = nn.Linear(
@@ -254,7 +261,9 @@ class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
         batch, num_anchors, block, _ = normalized.shape
         num_heads = int(self.settings["num_heads"])
         key_dim = int(self.settings["key_dim"])
-        query = self.context_query(normalized).view(
+        offsets = torch.arange(block, device=normalized.device)
+        query_in = normalized + self.horizon_embed(offsets)
+        query = self.context_query(query_in).view(
             batch, num_anchors, block, num_heads, key_dim
         )
         if self.settings["normalize_qk"]:

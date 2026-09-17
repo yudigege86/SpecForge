@@ -35,6 +35,11 @@ from torch import nn
 LinearContextVariant = Literal["gdn", "kda"]
 LinearContextBackend = Literal["auto", "naive", "fla"]
 
+# ``logsigmoid(8) ≈ -3.4e-4`` so ``α ≈ 0.9997`` (half-life ≈ 2k tokens).
+# Default ``nn.Linear`` + ``logsigmoid`` is ``α ≈ 0.5`` and memory dies in a
+# handful of steps. GDN/KDA training needs the long-memory end of that range.
+LOG_DECAY_BIAS_INIT = 8.0
+
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
@@ -124,7 +129,11 @@ def gated_delta_scan(
         state = key.new_zeros(batch, num_heads, key_dim, value_dim)
     else:
         state = initial_state
-    states = []
+    states = (
+        key.new_empty(batch, seq_len, num_heads, key_dim, value_dim)
+        if return_all_states
+        else None
+    )
     for time in range(seq_len):
         state = gated_delta_step(
             state,
@@ -133,10 +142,10 @@ def gated_delta_scan(
             log_decay[:, time],
             beta[:, time],
         )
-        if return_all_states:
-            states.append(state)
-    if return_all_states:
-        return torch.stack(states, dim=1)
+        if states is not None:
+            states[:, time] = state
+    if states is not None:
+        return states
     return state
 
 
@@ -239,12 +248,12 @@ def _fla_scan_and_gather(
     variant: LinearContextVariant,
     normalize_qk: bool = False,
 ) -> torch.Tensor:
-    """Gather prefix states by running an FLA chunk scan on each prefix.
+    """Opt-in FLA parity path: one chunk kernel per gathered prefix.
 
-    FLA's chunk kernels expose only a final state, so each gathered
-    ``S_{p-1}`` is the final state of ``c_1…c_{p-1}``. Duplicate prefix
-    work is acceptable here; training can later switch to a segmented
-    scan once the layer is wired.
+    FLA's public chunk kernels only return ``output_final_state``, so this
+    helper cannot emit a state tape. Training uses ``backend='auto'``, which
+    is one scan plus ``gather_prefix_states``. Keep this path for kernel
+    checks, not for ``num_anchors`` in the tens or hundreds.
     """
 
     chunk_fn = _import_fla_chunk(variant)
@@ -269,6 +278,32 @@ def _fla_scan_and_gather(
     return gathered
 
 
+def resolve_scan_backend(
+    backend: LinearContextBackend,
+    *,
+    on_cuda: bool = False,
+    num_anchors: int = 0,
+    has_initial_state: bool = False,
+    variant: LinearContextVariant = "gdn",
+) -> Literal["naive", "fla"]:
+    """Pick the scan implementation used to gather ``S_{p-1}``.
+
+    ``auto`` is always the one-pass state tape plus GPU gather. FLA chunk
+    kernels only expose a final state, so selecting them for many anchors
+    falls back to an ``O(A)`` host loop that training cannot afford.
+    ``backend='fla'`` remains an explicit kernel-parity opt-in.
+    """
+
+    del on_cuda, num_anchors, variant
+    if backend == "auto":
+        return "naive"
+    if backend == "fla":
+        return "naive" if has_initial_state else "fla"
+    if backend == "naive":
+        return "naive"
+    raise ValueError(f"unknown linear-context backend {backend!r}")
+
+
 def scan_and_gather(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -287,24 +322,14 @@ def scan_and_gather(
     0-based token indices; position ``0`` gathers the zero / initial state.
     """
 
-    if backend == "auto":
-        use_fla = (
-            key.is_cuda
-            and initial_state is None
-            and fla_available(variant)
-        )
-        backend = "fla" if use_fla else "naive"
+    backend = resolve_scan_backend(
+        backend,
+        on_cuda=bool(key.is_cuda),
+        num_anchors=int(anchor_positions.shape[1]),
+        has_initial_state=initial_state is not None,
+        variant=variant,
+    )
     if backend == "fla":
-        if initial_state is not None:
-            return _naive_scan_and_gather(
-                key,
-                value,
-                log_decay,
-                beta,
-                anchor_positions,
-                initial_state=initial_state,
-                normalize_qk=normalize_qk,
-            )
         return _fla_scan_and_gather(
             key,
             value,
@@ -363,6 +388,10 @@ class LinearContextScan(nn.Module):
             self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
         else:
             self.g_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
+        # Survives HF ``post_init`` Linear re-init: this is a Parameter, not a bias.
+        self.log_decay_bias = nn.Parameter(
+            torch.full((self.g_proj.out_features,), LOG_DECAY_BIAS_INIT)
+        )
 
     def _project(
         self, target_hidden: torch.Tensor
@@ -375,7 +404,7 @@ class LinearContextScan(nn.Module):
             batch, seq_len, self.num_heads, self.value_dim
         )
         beta = torch.sigmoid(self.beta_proj(target_hidden))
-        gate = self.g_proj(target_hidden)
+        gate = self.g_proj(target_hidden) + self.log_decay_bias
         if self.variant == "kda":
             gate = gate.view(batch, seq_len, self.num_heads, self.key_dim)
         log_decay = F.logsigmoid(gate)
@@ -403,10 +432,12 @@ class LinearContextScan(nn.Module):
 
 
 __all__ = [
+    "LOG_DECAY_BIAS_INIT",
     "LinearContextScan",
     "fla_available",
     "gated_delta_scan",
     "gated_delta_step",
+    "resolve_scan_backend",
     "gather_prefix_states",
     "scan_and_gather",
 ]

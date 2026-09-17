@@ -23,9 +23,11 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_LINEAR_CONTEXT)
 
 LinearContextScan = _LINEAR_CONTEXT.LinearContextScan
+LOG_DECAY_BIAS_INIT = _LINEAR_CONTEXT.LOG_DECAY_BIAS_INIT
 fla_available = _LINEAR_CONTEXT.fla_available
 gated_delta_scan = _LINEAR_CONTEXT.gated_delta_scan
 gather_prefix_states = _LINEAR_CONTEXT.gather_prefix_states
+resolve_scan_backend = _LINEAR_CONTEXT.resolve_scan_backend
 scan_and_gather = _LINEAR_CONTEXT.scan_and_gather
 
 
@@ -230,6 +232,70 @@ class LinearContextScanModuleTest(unittest.TestCase):
         self.assertGreater(scan.k_proj.weight.grad.abs().sum().item(), 0)
         self.assertIsNotNone(scan.g_proj.weight.grad)
         self.assertGreater(scan.g_proj.weight.grad.abs().sum().item(), 0)
+        self.assertIsNotNone(scan.log_decay_bias.grad)
+        self.assertGreater(scan.log_decay_bias.grad.abs().sum().item(), 0)
+
+    def test_auto_backend_is_one_scan_tape_even_on_cuda(self):
+        self.assertEqual(
+            resolve_scan_backend("auto", on_cuda=True, num_anchors=64),
+            "naive",
+        )
+        self.assertEqual(
+            resolve_scan_backend("auto", on_cuda=True, num_anchors=1),
+            "naive",
+        )
+        self.assertEqual(
+            resolve_scan_backend("fla", on_cuda=True, has_initial_state=True),
+            "naive",
+        )
+        self.assertEqual(
+            resolve_scan_backend("fla", on_cuda=True, has_initial_state=False),
+            "fla",
+        )
+
+    def test_decay_init_keeps_long_memory(self):
+        torch.manual_seed(0)
+        for variant in ("gdn", "kda"):
+            scan = LinearContextScan(
+                hidden_size=32,
+                num_heads=2,
+                key_dim=4,
+                value_dim=4,
+                variant=variant,
+                backend="naive",
+            )
+            torch.nn.init.zeros_(scan.g_proj.weight)
+            _, _, log_decay, _ = scan._project(torch.randn(2, 16, 32))
+            alpha = log_decay.exp()
+            expected = torch.sigmoid(
+                torch.tensor(LOG_DECAY_BIAS_INIT, dtype=alpha.dtype)
+            )
+            torch.testing.assert_close(
+                alpha.mean(),
+                expected,
+                atol=1e-5,
+                rtol=1e-5,
+                msg=variant,
+            )
+            # α^64 still > 0.5 so a short prefix does not wipe the state.
+            self.assertGreater((alpha.mean() ** 64).item(), 0.5, msg=variant)
+
+    def test_auto_scan_and_gather_does_not_call_per_anchor_fla(self):
+        key, value, log_decay, beta = _random_inputs("gdn")
+        anchors = torch.tensor([[1, 4, 8], [0, 3, 7]])
+
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("auto must not use per-anchor FLA")
+
+        original = _LINEAR_CONTEXT._fla_scan_and_gather
+        _LINEAR_CONTEXT._fla_scan_and_gather = _boom
+        try:
+            gathered = scan_and_gather(
+                key, value, log_decay, beta, anchors, backend="auto"
+            )
+        finally:
+            _LINEAR_CONTEXT._fla_scan_and_gather = original
+        self.assertEqual(tuple(gathered.shape), (2, 3, 2, 4, 5))
 
     def test_kda_module_gate_shape_is_channel_wise(self):
         scan = LinearContextScan(
@@ -283,22 +349,6 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
                     "GDN kernels are not importable"
                 )
 
-
-def _move_scan_inputs(variant, device, dtype=torch.bfloat16, **kwargs):
-    key, value, log_decay, beta = _random_inputs(variant, **kwargs)
-    return (
-        key.to(device=device, dtype=dtype),
-        value.to(device=device, dtype=dtype),
-        log_decay.to(device=device, dtype=dtype),
-        beta.to(device=device, dtype=dtype),
-    )
-
-
-@unittest.skipUnless(
-    _gpu_available() and fla_available("gdn"),
-    "FLA GDN chunk kernel needs a GPU (CUDA or ROCm) and flash-linear-attention",
-)
-class FlaGatedDeltaParityTest(unittest.TestCase):
     def _assert_fla_matches_naive(self, variant: str) -> None:
         device = torch.device("cuda")
         key, value, log_decay, beta = _move_scan_inputs(
@@ -332,6 +382,8 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             backend="fla",
             normalize_qk=True,
         )
+        # bf16 FLA vs the naive tape; characterized on MI355X. Tighten only
+        # after a wider device sweep — do not treat 8e-2 as a free pass.
         torch.testing.assert_close(fla.float(), naive.float(), atol=8e-2, rtol=8e-2)
 
     def test_fla_prefix_gather_matches_naive_gdn(self):
@@ -343,6 +395,34 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
     )
     def test_fla_prefix_gather_matches_naive_kda(self):
         self._assert_fla_matches_naive("kda")
+
+    def test_fla_prefix_gather_backward_is_finite(self):
+        device = torch.device("cuda")
+        key, value, log_decay, beta = _move_scan_inputs(
+            "gdn",
+            device,
+            batch=1,
+            seq_len=32,
+            heads=2,
+            key_dim=16,
+            value_dim=16,
+            seed=3,
+        )
+        key = key.detach().requires_grad_(True)
+        anchors = torch.tensor([[8, 24]], device=device)
+        gathered = scan_and_gather(
+            key,
+            value,
+            log_decay,
+            beta,
+            anchors,
+            variant="gdn",
+            backend="fla",
+            normalize_qk=True,
+        )
+        gathered.float().sum().backward()
+        self.assertIsNotNone(key.grad)
+        self.assertTrue(torch.isfinite(key.grad.float()).all())
 
 
 if __name__ == "__main__":

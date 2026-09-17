@@ -72,6 +72,21 @@ def resume_contract(config, draft_model, training_model):
         if suffix is None:
             raise ValueError(f"unexpected DFlash resume key {key!r}")
         renamed[f"{ALGORITHM_NAME}_{suffix}"] = value
+    from specforge.modeling.draft.dflash_linear import resolve_linear_context_settings
+
+    settings = resolve_linear_context_settings(draft_model.config)
+    renamed.update(
+        {
+            f"{ALGORITHM_NAME}_variant": settings["variant"],
+            f"{ALGORITHM_NAME}_injection": settings["injection"],
+            f"{ALGORITHM_NAME}_context_residual": bool(settings["context_residual"]),
+            f"{ALGORITHM_NAME}_backend": settings["backend"],
+            f"{ALGORITHM_NAME}_num_heads": int(settings["num_heads"]),
+            f"{ALGORITHM_NAME}_key_dim": int(settings["key_dim"]),
+            f"{ALGORITHM_NAME}_value_dim": int(settings["value_dim"]),
+            f"{ALGORITHM_NAME}_normalize_qk": bool(settings["normalize_qk"]),
+        }
+    )
     return renamed
 
 
