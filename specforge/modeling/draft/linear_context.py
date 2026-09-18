@@ -13,8 +13,10 @@ attention. The recurrence matches the paper:
 ``S_t = (I - β_t k_t k_t^T) D_t S_{t-1} + β_t k_t v_t^T``
 
 with scalar decay ``D_t = α_t I`` for GDN and channel-wise
-``D_t = diag(α_t)`` for KDA. Gates are stored in log space
-(``α = exp(g)``), matching flash-linear-attention's default ``g``.
+``D_t = diag(α_t)`` for KDA.
+
+Gates follow native GDN/KDA: ``g = -exp(A_log) * softplus(a + dt_bias)``
+(log-space ``α``), matching flash-linear-attention's ``use_gate_in_kernel``.
 
 On MI355X, install the ROCm extra against the image torch — do not overlay a
 CUDA wheel or reinstall torch from the PyTorch ROCm index:
@@ -26,6 +28,8 @@ See https://github.com/fla-org/flash-linear-attention#installation
 
 from __future__ import annotations
 
+import inspect
+import math
 from typing import Literal, Optional
 
 import torch
@@ -35,14 +39,44 @@ from torch import nn
 LinearContextVariant = Literal["gdn", "kda"]
 LinearContextBackend = Literal["auto", "naive", "fla"]
 
-# ``logsigmoid(8) ≈ -3.4e-4`` so ``α ≈ 0.9997`` (half-life ≈ 2k tokens).
-# Default ``nn.Linear`` + ``logsigmoid`` is ``α ≈ 0.5`` and memory dies in a
-# handful of steps. GDN/KDA training needs the long-memory end of that range.
-LOG_DECAY_BIAS_INIT = 8.0
+# FLA chunk kernels use 64; gather never materializes more than this many
+# per-token states at once (``T/C`` times less memory than a full tape).
+SCAN_CHUNK_SIZE = 64
+
+# Native GDN/KDA timescale init. ``A ~ U(0.25, 16)`` and
+# ``dt ~ LogU(1e-5, 0.1)`` so some channels retain tens of thousands of
+# tokens (32K-scale) while others stay short-memory. Stock FLA uses
+# ``dt_min=1e-3``; that alone gives a ~700-token half-life at ``A=1``.
+GDN_A_INIT_MIN = 0.25
+GDN_A_INIT_MAX = 16.0
+GDN_DT_MIN = 1e-5
+GDN_DT_MAX = 0.1
+GDN_DT_INIT_FLOOR = 1e-5
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt(x.pow(2).sum(dim=-1, keepdim=True) + eps)
+
+
+def _inverse_softplus(dt: torch.Tensor) -> torch.Tensor:
+    return dt + torch.log(-torch.expm1(-dt))
+
+
+def _init_A_log(num_channels: int) -> nn.Parameter:
+    values = torch.empty(num_channels).uniform_(GDN_A_INIT_MIN, GDN_A_INIT_MAX)
+    parameter = nn.Parameter(values.log())
+    parameter._no_weight_decay = True
+    return parameter
+
+
+def _init_dt_bias(num_channels: int) -> nn.Parameter:
+    dt = torch.exp(
+        torch.rand(num_channels) * (math.log(GDN_DT_MAX) - math.log(GDN_DT_MIN))
+        + math.log(GDN_DT_MIN)
+    ).clamp(min=GDN_DT_INIT_FLOOR)
+    parameter = nn.Parameter(_inverse_softplus(dt))
+    parameter._no_weight_decay = True
+    return parameter
 
 
 def _import_fla_chunk(variant: LinearContextVariant):
@@ -61,6 +95,13 @@ def fla_available(variant: LinearContextVariant = "gdn") -> bool:
     except ImportError:
         return False
     return True
+
+
+def _fla_accepts_initial_state(chunk_fn) -> bool:
+    try:
+        return "initial_state" in inspect.signature(chunk_fn).parameters
+    except (TypeError, ValueError):
+        return True
 
 
 def gated_delta_step(
@@ -149,6 +190,30 @@ def gated_delta_scan(
     return state
 
 
+def _validate_anchor_positions(
+    anchor_positions: torch.Tensor,
+    *,
+    batch: int,
+    seq_len: int,
+) -> None:
+    if anchor_positions.ndim != 2:
+        raise ValueError(
+            f"anchor_positions must be [B, A], got {tuple(anchor_positions.shape)}"
+        )
+    if anchor_positions.shape[0] != batch:
+        raise ValueError(
+            "anchor_positions batch does not match features: "
+            f"{tuple(anchor_positions.shape)} vs batch={batch}"
+        )
+    out_of_range = (anchor_positions < 0) | (anchor_positions > seq_len)
+    if bool(out_of_range.any()):
+        raise ValueError(
+            "anchor_positions must satisfy 0 <= p <= seq_len "
+            f"({seq_len}); got min={int(anchor_positions.min())} "
+            f"max={int(anchor_positions.max())}"
+        )
+
+
 def gather_prefix_states(
     states_after: torch.Tensor,
     anchor_positions: torch.Tensor,
@@ -165,23 +230,10 @@ def gather_prefix_states(
         raise ValueError(
             f"states_after must be [B, T, H, K, V], got {tuple(states_after.shape)}"
         )
-    if anchor_positions.ndim != 2:
-        raise ValueError(
-            f"anchor_positions must be [B, A], got {tuple(anchor_positions.shape)}"
-        )
     batch, seq_len, num_heads, key_dim, value_dim = states_after.shape
-    if anchor_positions.shape[0] != batch:
-        raise ValueError(
-            "anchor_positions batch does not match states_after: "
-            f"{tuple(anchor_positions.shape)} vs {tuple(states_after.shape)}"
-        )
-    out_of_range = (anchor_positions < 0) | (anchor_positions > seq_len)
-    if bool(out_of_range.any()):
-        raise ValueError(
-            "anchor_positions must satisfy 0 <= p <= seq_len "
-            f"({seq_len}); got min={int(anchor_positions.min())} "
-            f"max={int(anchor_positions.max())}"
-        )
+    _validate_anchor_positions(
+        anchor_positions, batch=batch, seq_len=seq_len
+    )
     prefix_index = (anchor_positions - 1).clamp(min=-1)
     gathered = states_after.new_zeros(
         batch, anchor_positions.shape[1], num_heads, key_dim, value_dim
@@ -198,7 +250,7 @@ def gather_prefix_states(
     return torch.where(valid[:, :, None, None, None], selected, gathered)
 
 
-def _naive_scan_and_gather(
+def _chunked_naive_scan_and_gather(
     key: torch.Tensor,
     value: torch.Tensor,
     log_decay: torch.Tensor,
@@ -207,17 +259,45 @@ def _naive_scan_and_gather(
     *,
     initial_state: Optional[torch.Tensor] = None,
     normalize_qk: bool = False,
+    chunk_size: int = SCAN_CHUNK_SIZE,
 ) -> torch.Tensor:
-    states = gated_delta_scan(
-        key,
-        value,
-        log_decay,
-        beta,
-        initial_state=initial_state,
-        return_all_states=True,
-        normalize_qk=normalize_qk,
+    """Gather ``S_{p-1}`` while only materializing a ``chunk_size`` state tape."""
+
+    batch, seq_len, num_heads, key_dim = key.shape
+    value_dim = value.shape[-1]
+    _validate_anchor_positions(anchor_positions, batch=batch, seq_len=seq_len)
+    gathered = key.new_zeros(
+        batch, anchor_positions.shape[1], num_heads, key_dim, value_dim
     )
-    return gather_prefix_states(states, anchor_positions)
+    prefix_index = anchor_positions - 1
+    running = initial_state
+    if running is None:
+        running = key.new_zeros(batch, num_heads, key_dim, value_dim)
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        tape = gated_delta_scan(
+            key[:, start:end],
+            value[:, start:end],
+            log_decay[:, start:end],
+            beta[:, start:end],
+            initial_state=running,
+            return_all_states=True,
+            normalize_qk=normalize_qk,
+        )
+        running = tape[:, -1]
+        in_chunk = (prefix_index >= start) & (prefix_index < end)
+        if not bool(in_chunk.any()):
+            continue
+        local = (prefix_index - start).clamp(min=0)
+        selected = torch.gather(
+            tape,
+            1,
+            local[:, :, None, None, None].expand(
+                -1, -1, num_heads, key_dim, value_dim
+            ),
+        )
+        gathered = torch.where(in_chunk[:, :, None, None, None], selected, gathered)
+    return gathered
 
 
 def _fla_prefix_state(
@@ -228,21 +308,111 @@ def _fla_prefix_state(
     beta: torch.Tensor,
     *,
     normalize_qk: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     dummy_query = torch.zeros_like(key)
+    kwargs = {
+        "scale": 1.0,
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": normalize_qk,
+    }
+    if initial_state is not None:
+        kwargs["initial_state"] = initial_state
     _output, final_state = chunk_fn(
         dummy_query,
         key,
         value,
         log_decay,
         beta,
-        scale=1.0,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=normalize_qk,
+        **kwargs,
     )
     if final_state is None:
         raise RuntimeError("FLA chunk kernel returned no final state")
     return final_state
+
+
+def _fla_chunked_scan_and_gather(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    anchor_positions: torch.Tensor,
+    *,
+    variant: LinearContextVariant,
+    normalize_qk: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
+    chunk_size: int = SCAN_CHUNK_SIZE,
+) -> torch.Tensor:
+    """GPU default: FLA chunk kernels with ``initial_state``, no full tape.
+
+    Each FLA window of ``chunk_size`` tokens emits only a final state.
+    Anchors inside a window reuse that window's start state and one extra
+    prefix kernel per unique local length (at most ``chunk_size``, never
+    ``num_anchors * seq_len``).
+    """
+
+    chunk_fn = _import_fla_chunk(variant)
+    batch, seq_len, num_heads, key_dim = key.shape
+    value_dim = value.shape[-1]
+    _validate_anchor_positions(anchor_positions, batch=batch, seq_len=seq_len)
+    if initial_state is not None and not _fla_accepts_initial_state(chunk_fn):
+        return _chunked_naive_scan_and_gather(
+            key,
+            value,
+            log_decay,
+            beta,
+            anchor_positions,
+            initial_state=initial_state,
+            normalize_qk=normalize_qk,
+            chunk_size=chunk_size,
+        )
+    gathered = key.new_zeros(
+        batch, anchor_positions.shape[1], num_heads, key_dim, value_dim
+    )
+    prefix_index = anchor_positions - 1
+    running = initial_state
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        chunk_key = key[:, start:end]
+        chunk_value = value[:, start:end]
+        chunk_decay = log_decay[:, start:end]
+        chunk_beta = beta[:, start:end]
+        in_chunk = (prefix_index >= start) & (prefix_index < end)
+        next_state = None
+        if bool(in_chunk.any()):
+            local = (prefix_index - start).clamp(min=0)
+            lengths = torch.unique(local[in_chunk])
+            last_index = end - start - 1
+            for length in lengths.tolist():
+                row_needs = in_chunk & (local == length)
+                ht = _fla_prefix_state(
+                    chunk_fn,
+                    chunk_key[:, : length + 1],
+                    chunk_value[:, : length + 1],
+                    chunk_decay[:, : length + 1],
+                    chunk_beta[:, : length + 1],
+                    normalize_qk=normalize_qk,
+                    initial_state=running,
+                )
+                gathered = torch.where(
+                    row_needs[:, :, None, None, None],
+                    ht[:, None],
+                    gathered,
+                )
+                if length == last_index:
+                    next_state = ht
+        if next_state is None:
+            next_state = _fla_prefix_state(
+                chunk_fn,
+                chunk_key,
+                chunk_value,
+                chunk_decay,
+                chunk_beta,
+                normalize_qk=normalize_qk,
+                initial_state=running,
+            )
+        running = next_state
+    return gathered
 
 
 def _fla_scan_and_gather(
@@ -254,35 +424,20 @@ def _fla_scan_and_gather(
     *,
     variant: LinearContextVariant,
     normalize_qk: bool = False,
+    initial_state: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Opt-in FLA parity path: one chunk kernel per gathered prefix.
+    """FLA gather used by ``backend='fla'`` and GPU ``auto``."""
 
-    FLA's public chunk kernels only return ``output_final_state``, so this
-    helper cannot emit a state tape. Training uses ``backend='auto'``, which
-    is one scan plus ``gather_prefix_states``. Keep this path for kernel
-    checks, not for ``num_anchors`` in the tens or hundreds.
-    """
-
-    chunk_fn = _import_fla_chunk(variant)
-    batch, _seq_len, num_heads, key_dim = key.shape
-    value_dim = value.shape[-1]
-    num_anchors = anchor_positions.shape[1]
-    gathered = key.new_zeros(batch, num_anchors, num_heads, key_dim, value_dim)
-    for batch_idx in range(batch):
-        for anchor_idx in range(num_anchors):
-            prefix = int(anchor_positions[batch_idx, anchor_idx].item())
-            if prefix <= 0:
-                continue
-            ht = _fla_prefix_state(
-                chunk_fn,
-                key[batch_idx : batch_idx + 1, :prefix],
-                value[batch_idx : batch_idx + 1, :prefix],
-                log_decay[batch_idx : batch_idx + 1, :prefix],
-                beta[batch_idx : batch_idx + 1, :prefix],
-                normalize_qk=normalize_qk,
-            )
-            gathered[batch_idx, anchor_idx] = ht[0]
-    return gathered
+    return _fla_chunked_scan_and_gather(
+        key,
+        value,
+        log_decay,
+        beta,
+        anchor_positions,
+        variant=variant,
+        normalize_qk=normalize_qk,
+        initial_state=initial_state,
+    )
 
 
 def resolve_scan_backend(
@@ -295,19 +450,18 @@ def resolve_scan_backend(
 ) -> Literal["naive", "fla"]:
     """Pick the scan implementation used to gather ``S_{p-1}``.
 
-    ``auto`` is always the one-pass state tape plus GPU gather. FLA chunk
-    kernels only expose a final state, so selecting them for many anchors
-    falls back to an ``O(A)`` host loop that training cannot afford.
-    ``backend='fla'`` remains an explicit kernel-parity opt-in.
+    ``auto`` uses chunked FLA whenever a GPU and the matching FLA kernel
+    are available. Otherwise it is the chunked naive scan (peak tape
+    ``SCAN_CHUNK_SIZE``, not ``seq_len``). Neither path is the old
+    per-anchor full-prefix FLA loop.
     """
 
-    del on_cuda, num_anchors, variant
-    if backend == "auto":
-        return "naive"
-    if backend == "fla":
-        return "naive" if has_initial_state else "fla"
+    del num_anchors, has_initial_state
+    want_fla = backend in {"auto", "fla"} and on_cuda and fla_available(variant)
     if backend == "naive":
         return "naive"
+    if backend in {"auto", "fla"}:
+        return "fla" if want_fla else "naive"
     raise ValueError(f"unknown linear-context backend {backend!r}")
 
 
@@ -345,10 +499,11 @@ def scan_and_gather(
             anchor_positions,
             variant=variant,
             normalize_qk=normalize_qk,
+            initial_state=initial_state,
         )
     if backend != "naive":
         raise ValueError(f"unknown linear-context backend {backend!r}")
-    return _naive_scan_and_gather(
+    return _chunked_naive_scan_and_gather(
         key,
         value,
         log_decay,
@@ -392,13 +547,12 @@ class LinearContextScan(nn.Module):
         self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
         self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
         if variant == "gdn":
-            self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
+            gate_out = num_heads
         else:
-            self.g_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
-        # Survives HF ``post_init`` Linear re-init: this is a Parameter, not a bias.
-        self.log_decay_bias = nn.Parameter(
-            torch.full((self.g_proj.out_features,), LOG_DECAY_BIAS_INIT)
-        )
+            gate_out = num_heads * key_dim
+        self.g_proj = nn.Linear(hidden_size, gate_out, bias=False)
+        self.A_log = _init_A_log(gate_out)
+        self.dt_bias = _init_dt_bias(gate_out)
 
     def _project(
         self, target_hidden: torch.Tensor
@@ -411,10 +565,15 @@ class LinearContextScan(nn.Module):
             batch, seq_len, self.num_heads, self.value_dim
         )
         beta = torch.sigmoid(self.beta_proj(target_hidden))
-        gate = self.g_proj(target_hidden) + self.log_decay_bias
+        gate = self.g_proj(target_hidden)
         if self.variant == "kda":
             gate = gate.view(batch, seq_len, self.num_heads, self.key_dim)
-        log_decay = F.logsigmoid(gate)
+            scale = self.A_log.exp().view(1, 1, self.num_heads, self.key_dim)
+            shift = self.dt_bias.view(1, 1, self.num_heads, self.key_dim)
+        else:
+            scale = self.A_log.exp().view(1, 1, self.num_heads)
+            shift = self.dt_bias.view(1, 1, self.num_heads)
+        log_decay = -scale * F.softplus(gate + shift)
         return key, value, log_decay, beta
 
     def forward(
@@ -439,8 +598,12 @@ class LinearContextScan(nn.Module):
 
 
 __all__ = [
-    "LOG_DECAY_BIAS_INIT",
+    "GDN_A_INIT_MAX",
+    "GDN_A_INIT_MIN",
+    "GDN_DT_MAX",
+    "GDN_DT_MIN",
     "LinearContextScan",
+    "SCAN_CHUNK_SIZE",
     "fla_available",
     "gated_delta_scan",
     "gated_delta_step",

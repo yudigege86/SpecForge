@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import unittest
 from pathlib import Path
@@ -23,7 +24,7 @@ assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_LINEAR_CONTEXT)
 
 LinearContextScan = _LINEAR_CONTEXT.LinearContextScan
-LOG_DECAY_BIAS_INIT = _LINEAR_CONTEXT.LOG_DECAY_BIAS_INIT
+SCAN_CHUNK_SIZE = _LINEAR_CONTEXT.SCAN_CHUNK_SIZE
 fla_available = _LINEAR_CONTEXT.fla_available
 gated_delta_scan = _LINEAR_CONTEXT.gated_delta_scan
 gather_prefix_states = _LINEAR_CONTEXT.gather_prefix_states
@@ -255,53 +256,74 @@ class LinearContextScanModuleTest(unittest.TestCase):
         self.assertGreater(scan.k_proj.weight.grad.abs().sum().item(), 0)
         self.assertIsNotNone(scan.g_proj.weight.grad)
         self.assertGreater(scan.g_proj.weight.grad.abs().sum().item(), 0)
-        self.assertIsNotNone(scan.log_decay_bias.grad)
-        self.assertGreater(scan.log_decay_bias.grad.abs().sum().item(), 0)
+        self.assertIsNotNone(scan.A_log.grad)
+        self.assertGreater(scan.A_log.grad.abs().sum().item(), 0)
+        self.assertIsNotNone(scan.dt_bias.grad)
+        self.assertGreater(scan.dt_bias.grad.abs().sum().item(), 0)
 
-    def test_auto_backend_is_one_scan_tape_even_on_cuda(self):
+    def test_auto_backend_uses_fla_on_gpu_when_available(self):
+        self.assertEqual(
+            resolve_scan_backend("auto", on_cuda=False, num_anchors=64),
+            "naive",
+        )
+        expected = "fla" if fla_available("gdn") else "naive"
         self.assertEqual(
             resolve_scan_backend("auto", on_cuda=True, num_anchors=64),
-            "naive",
+            expected,
         )
         self.assertEqual(
             resolve_scan_backend("auto", on_cuda=True, num_anchors=1),
-            "naive",
+            expected,
         )
         self.assertEqual(
             resolve_scan_backend("fla", on_cuda=True, has_initial_state=True),
-            "naive",
+            expected,
         )
         self.assertEqual(
-            resolve_scan_backend("fla", on_cuda=True, has_initial_state=False),
-            "fla",
+            resolve_scan_backend("naive", on_cuda=True),
+            "naive",
         )
 
-    def test_decay_init_keeps_long_memory(self):
+    def test_decay_init_has_a_timescale_spectrum(self):
         torch.manual_seed(0)
         for variant in ("gdn", "kda"):
             scan = LinearContextScan(
                 hidden_size=32,
-                num_heads=2,
+                num_heads=16,
                 key_dim=4,
                 value_dim=4,
                 variant=variant,
                 backend="naive",
             )
             torch.nn.init.zeros_(scan.g_proj.weight)
-            _, _, log_decay, _ = scan._project(torch.randn(2, 16, 32))
-            alpha = log_decay.exp()
-            expected = torch.sigmoid(
-                torch.tensor(LOG_DECAY_BIAS_INIT, dtype=alpha.dtype)
-            )
-            torch.testing.assert_close(
-                alpha.mean(),
-                expected,
-                atol=1e-5,
-                rtol=1e-5,
+            _, _, log_decay, _ = scan._project(torch.zeros(1, 1, 32))
+            alpha = log_decay.exp().reshape(-1).double()
+            half_life = math.log(0.5) / alpha.log()
+            self.assertGreater(
+                float(alpha.max() - alpha.min()),
+                1e-4,
                 msg=variant,
             )
-            # α^64 still > 0.5 so a short prefix does not wipe the state.
-            self.assertGreater((alpha.mean() ** 64).item(), 0.5, msg=variant)
+            self.assertGreater(half_life.max().item(), 256, msg=variant)
+            self.assertLess(half_life.min().item(), 1024, msg=variant)
+            scan.A_log.data.fill_(math.log(0.25))
+            dt = torch.full_like(scan.dt_bias.data, 1e-5)
+            scan.dt_bias.data.copy_(dt + torch.log(-torch.expm1(-dt)))
+            _, _, long_decay, _ = scan._project(torch.zeros(1, 1, 32))
+            long_alpha = long_decay.exp().reshape(-1).double().max()
+            self.assertGreater((long_alpha ** 32768).item(), 0.5, msg=variant)
+
+    def test_chunked_gather_matches_full_state_tape(self):
+        key, value, log_decay, beta = _random_inputs("gdn", seq_len=70)
+        anchors = torch.tensor([[0, 1, 64, 70], [3, 20, 65, 69]])
+        tape = gated_delta_scan(key, value, log_decay, beta, return_all_states=True)
+        torch.testing.assert_close(
+            gather_prefix_states(tape, anchors),
+            scan_and_gather(
+                key, value, log_decay, beta, anchors, backend="naive"
+            ),
+        )
+        self.assertGreater(tape.shape[1], SCAN_CHUNK_SIZE)
 
     def test_auto_scan_and_gather_does_not_call_per_anchor_fla(self):
         key, value, log_decay, beta = _random_inputs("gdn")

@@ -66,15 +66,10 @@ class DFlashLinearLayerTest(unittest.TestCase):
         self.assertEqual(model.layers[0].settings["backend"], "naive")
         self.assertEqual(model.layers[0].horizon_embed.num_embeddings, TINY["block_size"])
         self.assertEqual(model.layers[0].horizon_embed.embedding_dim, TINY["hidden_size"])
-        from specforge.modeling.draft.linear_context import LOG_DECAY_BIAS_INIT
-
-        torch.testing.assert_close(
-            model.layers[0].context_scan.log_decay_bias.detach().cpu(),
-            torch.full_like(
-                model.layers[0].context_scan.log_decay_bias.detach().cpu(),
-                LOG_DECAY_BIAS_INIT,
-            ),
-        )
+        scan = model.layers[0].context_scan
+        self.assertEqual(tuple(scan.A_log.shape), (scan.g_proj.out_features,))
+        self.assertEqual(tuple(scan.A_log.shape), tuple(scan.dt_bias.shape))
+        self.assertEqual(int(scan.A_log.numel()), 2)
 
     def test_forward_shape_is_packed_blocks_not_context_plus_block(self):
         model = _tiny_model()
