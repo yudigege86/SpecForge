@@ -190,7 +190,8 @@ def algorithm_spec() -> AlgorithmSpec:
             ),
         ),
         capabilities=AlgorithmCapabilities(
-            attention_backends={"eager", "sdpa", "flex_attention"},
+            # Block mixing is always SDPA; trainer FlexAttention is unused.
+            attention_backends={"sdpa"},
         ),
     )
 

@@ -193,6 +193,29 @@ class PrefixStateGatherTest(unittest.TestCase):
                     rtol=0,
                 )
 
+    def test_out_of_range_anchors_are_rejected(self):
+        key, value, log_decay, beta = _random_inputs("gdn", seq_len=8)
+        with self.assertRaisesRegex(ValueError, r"0 <= p <= seq_len"):
+            scan_and_gather(
+                key,
+                value,
+                log_decay,
+                beta,
+                torch.tensor([[0, 9]]),
+                variant="gdn",
+                backend="naive",
+            )
+        with self.assertRaisesRegex(ValueError, r"0 <= p <= seq_len"):
+            scan_and_gather(
+                key,
+                value,
+                log_decay,
+                beta,
+                torch.tensor([[-1, 3]]),
+                variant="gdn",
+                backend="naive",
+            )
+
     def test_gather_from_full_state_tape_matches_scan_and_gather(self):
         key, value, log_decay, beta = _random_inputs("gdn")
         anchors = torch.tensor([[1, 5, 8], [0, 3, 7]])
@@ -423,6 +446,37 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
         gathered.float().sum().backward()
         self.assertIsNotNone(key.grad)
         self.assertTrue(torch.isfinite(key.grad.float()).all())
+
+    def test_fla_prefix_gather_backward_matches_naive(self):
+        device = torch.device("cuda")
+        key, value, log_decay, beta = _move_scan_inputs(
+            "gdn",
+            device,
+            batch=1,
+            seq_len=32,
+            heads=2,
+            key_dim=16,
+            value_dim=16,
+            seed=4,
+        )
+        anchors = torch.tensor([[8, 24]], device=device)
+        grads = {}
+        for backend in ("naive", "fla"):
+            inputs = [
+                tensor.detach().clone().requires_grad_(True)
+                for tensor in (key, value, log_decay, beta)
+            ]
+            gathered = scan_and_gather(
+                *inputs,
+                anchors,
+                variant="gdn",
+                backend=backend,
+                normalize_qk=True,
+            )
+            gathered.float().sum().backward()
+            grads[backend] = [tensor.grad.float() for tensor in inputs]
+        for naive_grad, fla_grad in zip(grads["naive"], grads["fla"]):
+            torch.testing.assert_close(fla_grad, naive_grad, atol=8e-2, rtol=8e-2)
 
 
 if __name__ == "__main__":

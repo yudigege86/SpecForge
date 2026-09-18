@@ -175,6 +175,13 @@ def gather_prefix_states(
             "anchor_positions batch does not match states_after: "
             f"{tuple(anchor_positions.shape)} vs {tuple(states_after.shape)}"
         )
+    out_of_range = (anchor_positions < 0) | (anchor_positions > seq_len)
+    if bool(out_of_range.any()):
+        raise ValueError(
+            "anchor_positions must satisfy 0 <= p <= seq_len "
+            f"({seq_len}); got min={int(anchor_positions.min())} "
+            f"max={int(anchor_positions.max())}"
+        )
     prefix_index = (anchor_positions - 1).clamp(min=-1)
     gathered = states_after.new_zeros(
         batch, anchor_positions.shape[1], num_heads, key_dim, value_dim

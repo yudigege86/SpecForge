@@ -79,6 +79,7 @@ class DFlashLinearRegistrationTest(unittest.TestCase):
         self.assertEqual(linear_context["variant"], "gdn")
         self.assertEqual(linear_context["injection"], "gated_residual")
         self.assertTrue(linear_context["context_residual"])
+        self.assertEqual(_yaml_scalar(RECIPE, "attention_backend"), "sdpa")
 
     def test_ablation_recipes_are_first_class_config(self):
         ablations = {

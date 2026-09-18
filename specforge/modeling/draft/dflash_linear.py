@@ -64,6 +64,22 @@ def resolve_linear_context_settings(config: Qwen3Config) -> dict:
     return settings
 
 
+def _reject_linear_sliding_window(config: Qwen3Config) -> None:
+    """Recurrent prefix scan is full-context; sliding DFlash configs are invalid."""
+
+    if bool(getattr(config, "use_sliding_window", False)):
+        raise ValueError(
+            "DFlashLinearDraftModel does not support sliding-window configs; "
+            "the recurrent scan is full-prefix"
+        )
+    layer_types = list(getattr(config, "layer_types", None) or [])
+    if any(str(layer_type) == "sliding_attention" for layer_type in layer_types):
+        raise ValueError(
+            "DFlashLinearDraftModel does not support sliding_attention layers; "
+            "the recurrent scan is full-prefix"
+        )
+
+
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1:
         return hidden_states
@@ -288,6 +304,19 @@ class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
                 f"packed draft length {packed} is not divisible by block_size {block}"
             )
         num_anchors = packed // block
+        if tuple(anchor_positions.shape) != (batch, num_anchors):
+            raise ValueError(
+                "anchor_positions must have shape (batch, packed // block_size) "
+                f"= ({batch}, {num_anchors}), got {tuple(anchor_positions.shape)}"
+            )
+        if block_keep_mask is not None and tuple(block_keep_mask.shape) != (
+            batch,
+            num_anchors,
+        ):
+            raise ValueError(
+                "block_keep_mask must have shape (batch, packed // block_size) "
+                f"= ({batch}, {num_anchors}), got {tuple(block_keep_mask.shape)}"
+            )
         blocks = hidden_states.view(batch, num_anchors, block, hidden_size)
         prefix_state = self.context_scan(fused_target, anchor_positions)
         residual = blocks
@@ -336,6 +365,10 @@ class DFlashLinearDraftModel(DFlashDraftModel):
     _no_split_modules = ["DFlashLinearDecoderLayer"]
     decoder_layer_class = DFlashLinearDecoderLayer
 
+    def __init__(self, config, dflash_kernels=None) -> None:
+        _reject_linear_sliding_window(config)
+        super().__init__(config, dflash_kernels=dflash_kernels)
+
     def _build_decoder_layer(
         self,
         config: Qwen3Config,
@@ -374,7 +407,10 @@ class DFlashLinearDraftModel(DFlashDraftModel):
         hidden_states = noise_embedding
         packed = hidden_states.shape[1]
         if position_ids.shape[1] != packed:
-            position_ids = position_ids[:, -packed:]
+            raise ValueError(
+                "DFlashLinearDraftModel expects draft-only position_ids of "
+                f"length {packed}, got {position_ids.shape[1]}"
+            )
         fused_target = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
         for layer in self.layers:

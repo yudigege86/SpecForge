@@ -181,7 +181,25 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                dflash_config={
+                    "linear_context": {
+                        "variant": "gdn",
+                        "injection": "gated_residual",
+                        "context_residual": True,
+                        "backend": "auto",
+                        "num_heads": 2,
+                        "key_dim": 16,
+                        "value_dim": 16,
+                        "normalize_qk": True,
+                    }
+                },
+            ),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
@@ -255,6 +273,14 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dflash_linear_lk_loss_type",
                 "dflash_linear_kl_scale",
                 "dflash_linear_kl_decay",
+                "dflash_linear_variant",
+                "dflash_linear_injection",
+                "dflash_linear_context_residual",
+                "dflash_linear_backend",
+                "dflash_linear_num_heads",
+                "dflash_linear_key_dim",
+                "dflash_linear_value_dim",
+                "dflash_linear_normalize_qk",
             },
             "domino": {
                 "domino_block_size",

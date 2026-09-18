@@ -43,9 +43,11 @@ TINY = {
 }
 
 
-def _tiny_model(**linear_context):
+def _tiny_model(*, config_updates=None, **linear_context):
     payload = json.loads(json.dumps(TINY))
     payload["dflash_config"]["linear_context"].update(linear_context)
+    if config_updates:
+        payload.update(config_updates)
     fd, path = tempfile.mkstemp(suffix=".json")
     with os.fdopen(fd, "w") as handle:
         json.dump(payload, handle)
@@ -251,6 +253,7 @@ class DFlashLinearLayerTest(unittest.TestCase):
             loss_mask=loss_mask,
         )
         self.assertTrue(torch.isfinite(loss))
+        optimizer = torch.optim.SGD(draft.parameters(), lr=1e-3)
         loss.backward()
         grads = [
             parameter.grad.abs().sum()
@@ -259,6 +262,59 @@ class DFlashLinearLayerTest(unittest.TestCase):
         ]
         self.assertTrue(grads)
         self.assertGreater(sum(grads).item(), 0)
+        scan_grads = [
+            name
+            for name, parameter in draft.named_parameters()
+            if parameter.grad is not None and "context_scan" in name
+        ]
+        self.assertTrue(scan_grads)
+        optimizer.step()
+        second, _accuracy, _metrics = wrapper(
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            loss_mask=loss_mask,
+        )
+        self.assertTrue(torch.isfinite(second))
+
+    def test_sliding_window_config_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "sliding-window"):
+            _tiny_model(config_updates={"use_sliding_window": True})
+        with self.assertRaisesRegex(ValueError, "sliding_attention"):
+            _tiny_model(config_updates={"layer_types": ["sliding_attention"]})
+
+    def test_draft_position_ids_must_match_packed_length(self):
+        model = _tiny_model()
+        noise = torch.randn(1, 4, 64)
+        target = torch.randn(1, 16, 64)
+        anchors = torch.tensor([[5]])
+        with self.assertRaisesRegex(ValueError, "draft-only position_ids"):
+            model(
+                position_ids=torch.arange(8).view(1, -1),
+                noise_embedding=noise,
+                target_hidden=target,
+                anchor_positions=anchors,
+            )
+
+    def test_anchor_and_keep_mask_shapes_are_validated(self):
+        model = _tiny_model()
+        noise = torch.randn(1, 4, 64)
+        target = torch.randn(1, 16, 64)
+        position_ids = torch.arange(4).view(1, -1)
+        with self.assertRaisesRegex(ValueError, "anchor_positions must have shape"):
+            model(
+                position_ids=position_ids,
+                noise_embedding=noise,
+                target_hidden=target,
+                anchor_positions=torch.tensor([[5, 8]]),
+            )
+        with self.assertRaisesRegex(ValueError, "block_keep_mask must have shape"):
+            model(
+                position_ids=position_ids,
+                noise_embedding=noise,
+                target_hidden=target,
+                anchor_positions=torch.tensor([[5]]),
+                block_keep_mask=torch.tensor([[True, False]]),
+            )
 
     def test_resume_contract_persists_linear_settings(self):
         from types import SimpleNamespace

@@ -24,7 +24,7 @@ training:
   learning_rate: 6.0e-4
   warmup_ratio: 0.04
   max_grad_norm: 1
-  attention_backend: "flex_attention"
+  attention_backend: "sdpa"
   num_anchors: 512
   loss_decay_gamma: 7
   save_interval: 1000
