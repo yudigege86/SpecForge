@@ -335,8 +335,8 @@ class LinearContextScanModuleTest(unittest.TestCase):
                 variant=variant,
                 backend="naive",
             ).to(dtype=torch.bfloat16)
-            self.assertEqual(scan.A_log.dtype, torch.float32)
-            self.assertEqual(scan.dt_bias.dtype, torch.float32)
+            self.assertEqual(scan.A_log.dtype, torch.bfloat16)
+            self.assertEqual(scan.dt_bias.dtype, torch.bfloat16)
             hidden = torch.randn(2, 20, 16, dtype=torch.bfloat16, requires_grad=True)
             anchors = torch.tensor([[2, 8, 20], [0, 5, 19]])
             gathered = scan(hidden, anchors)
@@ -454,6 +454,7 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
         )
         # bf16 FLA vs the naive tape; characterized on MI355X. Tighten only
         # after a wider device sweep — do not treat 8e-2 as a free pass.
+        self.assertEqual(fla.dtype, key.dtype)
         torch.testing.assert_close(fla.float(), naive.float(), atol=8e-2, rtol=8e-2)
 
     def test_fla_prefix_gather_matches_naive_gdn(self):
@@ -559,6 +560,7 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             backend="fla",
             normalize_qk=True,
         )
+        self.assertEqual(fla.dtype, key.dtype)
         torch.testing.assert_close(fla.float(), naive.float(), atol=8e-2, rtol=8e-2)
         grads = {}
         for backend in ("naive", "fla"):

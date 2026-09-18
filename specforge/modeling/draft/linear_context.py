@@ -19,8 +19,9 @@ Gates follow native GDN/KDA: ``g = -exp(A_log) * softplus(a + dt_bias)``
 (log-space ``α``), matching flash-linear-attention's ``use_gate_in_kernel``.
 GDN uses per-head ``A_log`` and ``dt_bias`` with shape ``[H]``. KDA uses
 native shapes: ``A_log`` is ``[H]`` (broadcast over the key dim) and
-``dt_bias`` is ``[H*K]``. Both stay FP32; the scan itself runs in the
-feature dtype (BF16 in the default recipe).
+``dt_bias`` is ``[H*K]``. Gate math is FP32; the parameters themselves
+follow the module dtype so FSDP can flatten a BF16 draft. The scan
+runs in the feature dtype (BF16 in the default recipe).
 
 On MI355X, install the ROCm extra against the image torch — do not overlay a
 CUDA wheel or reinstall torch from the PyTorch ROCm index:
@@ -203,9 +204,9 @@ def _align_scan_tensors(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Force recurrent tensors onto ``key.dtype``.
 
-    ``A_log`` / ``dt_bias`` stay FP32; the projected gate is cast to the
-    feature dtype before the scan so BF16 naive ``alpha * state`` and
-    ``einsum`` do not mix FP32 and BF16.
+    Gate math is FP32, then ``log_decay`` is cast to the feature dtype
+    before the scan so BF16 naive ``alpha * state`` and ``einsum`` do
+    not mix FP32 and BF16.
     """
 
     dtype = key.dtype
@@ -388,7 +389,8 @@ def _fla_varlen_final_states(
     )
     if final_state is None:
         raise RuntimeError("FLA chunk kernel returned no final state")
-    return final_state
+    # ROCm FLA often returns FP32 states even when the packed tensors are BF16.
+    return final_state.to(dtype=key.dtype)
 
 
 def _fla_prefix_state(
@@ -419,7 +421,7 @@ def _fla_prefix_state(
     )
     if final_state is None:
         raise RuntimeError("FLA chunk kernel returned no final state")
-    return final_state
+    return final_state.to(dtype=key.dtype)
 
 
 def _fla_chunked_scan_and_gather(
@@ -688,13 +690,6 @@ class LinearContextScan(nn.Module):
             self.g_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
             self.A_log = _init_A_log(num_heads)
             self.dt_bias = _init_dt_bias(num_heads * key_dim)
-
-    def _apply(self, fn, *args, **kwargs):
-        out = super()._apply(fn, *args, **kwargs)
-        # Gate timescale parameters stay FP32 under ``module.to(bf16)``.
-        self.A_log.data = self.A_log.data.float()
-        self.dt_bias.data = self.dt_bias.data.float()
-        return out
 
     def _project(
         self, target_hidden: torch.Tensor
