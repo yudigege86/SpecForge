@@ -17,6 +17,10 @@ with scalar decay ``D_t = α_t I`` for GDN and channel-wise
 
 Gates follow native GDN/KDA: ``g = -exp(A_log) * softplus(a + dt_bias)``
 (log-space ``α``), matching flash-linear-attention's ``use_gate_in_kernel``.
+GDN uses per-head ``A_log`` and ``dt_bias`` with shape ``[H]``. KDA uses
+native shapes: ``A_log`` is ``[H]`` (broadcast over the key dim) and
+``dt_bias`` is ``[H*K]``. Both stay FP32; the scan itself runs in the
+feature dtype (BF16 in the default recipe).
 
 On MI355X, install the ROCm extra against the image torch — do not overlay a
 CUDA wheel or reinstall torch from the PyTorch ROCm index:
@@ -190,6 +194,29 @@ def gated_delta_scan(
     return state
 
 
+def _align_scan_tensors(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """Force recurrent tensors onto ``key.dtype``.
+
+    ``A_log`` / ``dt_bias`` stay FP32; the projected gate is cast to the
+    feature dtype before the scan so BF16 naive ``alpha * state`` and
+    ``einsum`` do not mix FP32 and BF16.
+    """
+
+    dtype = key.dtype
+    value = value.to(dtype=dtype)
+    log_decay = log_decay.to(dtype=dtype)
+    beta = beta.to(dtype=dtype)
+    if initial_state is not None:
+        initial_state = initial_state.to(dtype=dtype)
+    return key, value, log_decay, beta, initial_state
+
+
 def _validate_anchor_positions(
     anchor_positions: torch.Tensor,
     *,
@@ -300,6 +327,70 @@ def _chunked_naive_scan_and_gather(
     return gathered
 
 
+def _fla_accepts_cu_seqlens(chunk_fn) -> bool:
+    try:
+        return "cu_seqlens" in inspect.signature(chunk_fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _concat_varlen(tensor: torch.Tensor, batch_index, lengths) -> torch.Tensor:
+    pieces = [
+        tensor[batch, :length]
+        for batch, length in zip(batch_index.tolist(), lengths.tolist())
+    ]
+    return torch.cat(pieces, dim=0).unsqueeze(0)
+
+
+def _fla_varlen_final_states(
+    chunk_fn,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    batch_index: torch.Tensor,
+    lengths: torch.Tensor,
+    *,
+    normalize_qk: bool,
+    initial_state: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """One FLA launch for many prefixes via ``cu_seqlens`` (batch flattened to 1)."""
+
+    packed_key = _concat_varlen(key, batch_index, lengths)
+    packed_value = _concat_varlen(value, batch_index, lengths)
+    packed_decay = _concat_varlen(log_decay, batch_index, lengths)
+    packed_beta = _concat_varlen(beta, batch_index, lengths)
+    dummy_query = torch.zeros_like(packed_key)
+    cu_seqlens = torch.zeros(
+        lengths.numel() + 1, dtype=torch.long, device=key.device
+    )
+    cu_seqlens[1:] = lengths.to(dtype=torch.long).cumsum(0)
+    kwargs = {
+        "scale": 1.0,
+        "output_final_state": True,
+        "use_qk_l2norm_in_kernel": normalize_qk,
+        "cu_seqlens": cu_seqlens,
+    }
+    if initial_state is None:
+        num_heads, key_dim = key.shape[2], key.shape[3]
+        value_dim = value.shape[-1]
+        h0 = key.new_zeros(lengths.numel(), num_heads, key_dim, value_dim)
+    else:
+        h0 = initial_state[batch_index]
+    kwargs["initial_state"] = h0
+    _output, final_state = chunk_fn(
+        dummy_query,
+        packed_key,
+        packed_value,
+        packed_decay,
+        packed_beta,
+        **kwargs,
+    )
+    if final_state is None:
+        raise RuntimeError("FLA chunk kernel returned no final state")
+    return final_state
+
+
 def _fla_prefix_state(
     chunk_fn,
     key: torch.Tensor,
@@ -343,12 +434,13 @@ def _fla_chunked_scan_and_gather(
     initial_state: Optional[torch.Tensor] = None,
     chunk_size: int = SCAN_CHUNK_SIZE,
 ) -> torch.Tensor:
-    """GPU default: FLA chunk kernels with ``initial_state``, no full tape.
+    """GPU default: one FLA launch per window, chained through ``initial_state``.
 
-    Each FLA window of ``chunk_size`` tokens emits only a final state.
-    Anchors inside a window reuse that window's start state and one extra
-    prefix kernel per unique local length (at most ``chunk_size``, never
-    ``num_anchors * seq_len``).
+    When the kernel accepts ``cu_seqlens``, every in-window prefix plus the
+    full window (for the next ``running`` state) is packed into that launch.
+    Otherwise unique local lengths still share a batched kernel, not a
+    per-anchor full-prefix rescan. Host packing is O(anchors in the window);
+    kernel count is O(seq_len / chunk_size).
     """
 
     chunk_fn = _import_fla_chunk(variant)
@@ -366,6 +458,9 @@ def _fla_chunked_scan_and_gather(
             normalize_qk=normalize_qk,
             chunk_size=chunk_size,
         )
+    use_varlen = _fla_accepts_cu_seqlens(chunk_fn) and _fla_accepts_initial_state(
+        chunk_fn
+    )
     gathered = key.new_zeros(
         batch, anchor_positions.shape[1], num_heads, key_dim, value_dim
     )
@@ -378,11 +473,44 @@ def _fla_chunked_scan_and_gather(
         chunk_decay = log_decay[:, start:end]
         chunk_beta = beta[:, start:end]
         in_chunk = (prefix_index >= start) & (prefix_index < end)
+        window = end - start
+        if use_varlen:
+            local = (prefix_index - start).clamp(min=0)
+            row, col = torch.nonzero(in_chunk, as_tuple=True)
+            full_batch = torch.arange(batch, device=key.device)
+            full_length = torch.full(
+                (batch,), window, device=key.device, dtype=torch.long
+            )
+            if row.numel():
+                pack_batch = torch.cat([full_batch, row])
+                pack_length = torch.cat([full_length, local[row, col] + 1])
+            else:
+                pack_batch = full_batch
+                pack_length = full_length
+            try:
+                finals = _fla_varlen_final_states(
+                    chunk_fn,
+                    chunk_key,
+                    chunk_value,
+                    chunk_decay,
+                    chunk_beta,
+                    pack_batch,
+                    pack_length,
+                    normalize_qk=normalize_qk,
+                    initial_state=running,
+                )
+            except TypeError:
+                use_varlen = False
+            else:
+                running = finals[:batch]
+                if row.numel():
+                    gathered[row, col] = finals[batch:]
+                continue
         next_state = None
         if bool(in_chunk.any()):
             local = (prefix_index - start).clamp(min=0)
             lengths = torch.unique(local[in_chunk])
-            last_index = end - start - 1
+            last_index = window - 1
             for length in lengths.tolist():
                 row_needs = in_chunk & (local == length)
                 ht = _fla_prefix_state(
@@ -490,6 +618,9 @@ def scan_and_gather(
         has_initial_state=initial_state is not None,
         variant=variant,
     )
+    key, value, log_decay, beta, initial_state = _align_scan_tensors(
+        key, value, log_decay, beta, initial_state
+    )
     if backend == "fla":
         return _fla_scan_and_gather(
             key,
@@ -546,18 +677,30 @@ class LinearContextScan(nn.Module):
         self.k_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
         self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        # Native FLA: GDN ``A_log``/``dt_bias`` are per head ``[H]``. KDA uses
+        # ``A_log`` per head ``[H]`` broadcast over the key dim and ``dt_bias``
+        # per head/key channel ``[H*K]``. ``g_proj`` matches the gate tensor.
         if variant == "gdn":
-            gate_out = num_heads
+            self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
+            self.A_log = _init_A_log(num_heads)
+            self.dt_bias = _init_dt_bias(num_heads)
         else:
-            gate_out = num_heads * key_dim
-        self.g_proj = nn.Linear(hidden_size, gate_out, bias=False)
-        self.A_log = _init_A_log(gate_out)
-        self.dt_bias = _init_dt_bias(gate_out)
+            self.g_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
+            self.A_log = _init_A_log(num_heads)
+            self.dt_bias = _init_dt_bias(num_heads * key_dim)
+
+    def _apply(self, fn, *args, **kwargs):
+        out = super()._apply(fn, *args, **kwargs)
+        # Gate timescale parameters stay FP32 under ``module.to(bf16)``.
+        self.A_log.data = self.A_log.data.float()
+        self.dt_bias.data = self.dt_bias.data.float()
+        return out
 
     def _project(
         self, target_hidden: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = target_hidden.shape
+        dtype = target_hidden.dtype
         key = self.k_proj(target_hidden).view(
             batch, seq_len, self.num_heads, self.key_dim
         )
@@ -568,12 +711,12 @@ class LinearContextScan(nn.Module):
         gate = self.g_proj(target_hidden)
         if self.variant == "kda":
             gate = gate.view(batch, seq_len, self.num_heads, self.key_dim)
-            scale = self.A_log.exp().view(1, 1, self.num_heads, self.key_dim)
-            shift = self.dt_bias.view(1, 1, self.num_heads, self.key_dim)
+            scale = self.A_log.float().exp().view(1, 1, self.num_heads, 1)
+            shift = self.dt_bias.float().view(1, 1, self.num_heads, self.key_dim)
         else:
-            scale = self.A_log.exp().view(1, 1, self.num_heads)
-            shift = self.dt_bias.view(1, 1, self.num_heads)
-        log_decay = -scale * F.softplus(gate + shift)
+            scale = self.A_log.float().exp().view(1, 1, self.num_heads)
+            shift = self.dt_bias.float().view(1, 1, self.num_heads)
+        log_decay = (-scale * F.softplus(gate.float() + shift)).to(dtype=dtype)
         return key, value, log_decay, beta
 
     def forward(

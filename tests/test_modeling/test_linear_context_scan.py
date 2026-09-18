@@ -325,6 +325,29 @@ class LinearContextScanModuleTest(unittest.TestCase):
         )
         self.assertGreater(tape.shape[1], SCAN_CHUNK_SIZE)
 
+    def test_naive_bf16_projection_scan_and_backward(self):
+        for variant in ("gdn", "kda"):
+            scan = LinearContextScan(
+                hidden_size=16,
+                num_heads=2,
+                key_dim=4,
+                value_dim=4,
+                variant=variant,
+                backend="naive",
+            ).to(dtype=torch.bfloat16)
+            self.assertEqual(scan.A_log.dtype, torch.float32)
+            self.assertEqual(scan.dt_bias.dtype, torch.float32)
+            hidden = torch.randn(2, 20, 16, dtype=torch.bfloat16, requires_grad=True)
+            anchors = torch.tensor([[2, 8, 20], [0, 5, 19]])
+            gathered = scan(hidden, anchors)
+            self.assertEqual(gathered.dtype, torch.bfloat16)
+            gathered.float().sum().backward()
+            self.assertIsNotNone(hidden.grad)
+            self.assertTrue(torch.isfinite(hidden.grad.float()).all())
+            self.assertTrue(torch.isfinite(scan.k_proj.weight.grad.float()).all())
+            self.assertTrue(torch.isfinite(scan.A_log.grad.float()).all())
+            self.assertTrue(torch.isfinite(scan.dt_bias.grad.float()).all())
+
     def test_auto_scan_and_gather_does_not_call_per_anchor_fla(self):
         key, value, log_decay, beta = _random_inputs("gdn")
         anchors = torch.tensor([[1, 4, 8], [0, 3, 7]])
@@ -352,6 +375,8 @@ class LinearContextScanModuleTest(unittest.TestCase):
             backend="naive",
         )
         self.assertEqual(tuple(scan.g_proj.weight.shape), (2 * 3, 16))
+        self.assertEqual(tuple(scan.A_log.shape), (2,))
+        self.assertEqual(tuple(scan.dt_bias.shape), (2 * 3,))
         gathered = scan(torch.randn(1, 4, 16), torch.tensor([[0, 4]]))
         self.assertEqual(tuple(gathered.shape), (1, 2, 2, 3, 5))
         torch.testing.assert_close(
@@ -482,6 +507,59 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             seed=4,
         )
         anchors = torch.tensor([[8, 24]], device=device)
+        grads = {}
+        for backend in ("naive", "fla"):
+            inputs = [
+                tensor.detach().clone().requires_grad_(True)
+                for tensor in (key, value, log_decay, beta)
+            ]
+            gathered = scan_and_gather(
+                *inputs,
+                anchors,
+                variant="gdn",
+                backend=backend,
+                normalize_qk=True,
+            )
+            gathered.float().sum().backward()
+            grads[backend] = [tensor.grad.float() for tensor in inputs]
+        for naive_grad, fla_grad in zip(grads["naive"], grads["fla"]):
+            torch.testing.assert_close(fla_grad, naive_grad, atol=8e-2, rtol=8e-2)
+
+    def test_fla_multi_chunk_forward_and_backward_matches_naive(self):
+        device = torch.device("cuda")
+        key, value, log_decay, beta = _move_scan_inputs(
+            "gdn",
+            device,
+            batch=1,
+            seq_len=192,
+            heads=2,
+            key_dim=16,
+            value_dim=16,
+            seed=5,
+        )
+        # Three SCAN_CHUNK_SIZE=64 windows: [0,64), [64,128), [128,192].
+        anchors = torch.tensor([[20, 80, 150, 192]], device=device)
+        naive = scan_and_gather(
+            key,
+            value,
+            log_decay,
+            beta,
+            anchors,
+            variant="gdn",
+            backend="naive",
+            normalize_qk=True,
+        )
+        fla = scan_and_gather(
+            key,
+            value,
+            log_decay,
+            beta,
+            anchors,
+            variant="gdn",
+            backend="fla",
+            normalize_qk=True,
+        )
+        torch.testing.assert_close(fla.float(), naive.float(), atol=8e-2, rtol=8e-2)
         grads = {}
         for backend in ("naive", "fla"):
             inputs = [
