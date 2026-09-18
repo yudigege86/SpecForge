@@ -525,10 +525,10 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
         for naive_grad, fla_grad in zip(grads["naive"], grads["fla"]):
             torch.testing.assert_close(fla_grad, naive_grad, atol=8e-2, rtol=8e-2)
 
-    def test_fla_multi_chunk_forward_and_backward_matches_naive(self):
+    def _assert_fla_multi_chunk_matches_naive(self, variant: str) -> None:
         device = torch.device("cuda")
         key, value, log_decay, beta = _move_scan_inputs(
-            "gdn",
+            variant,
             device,
             batch=1,
             seq_len=192,
@@ -545,7 +545,7 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             log_decay,
             beta,
             anchors,
-            variant="gdn",
+            variant=variant,
             backend="naive",
             normalize_qk=True,
         )
@@ -555,7 +555,7 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             log_decay,
             beta,
             anchors,
-            variant="gdn",
+            variant=variant,
             backend="fla",
             normalize_qk=True,
         )
@@ -569,7 +569,7 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             gathered = scan_and_gather(
                 *inputs,
                 anchors,
-                variant="gdn",
+                variant=variant,
                 backend=backend,
                 normalize_qk=True,
             )
@@ -577,6 +577,16 @@ class FlaGatedDeltaParityTest(unittest.TestCase):
             grads[backend] = [tensor.grad.float() for tensor in inputs]
         for naive_grad, fla_grad in zip(grads["naive"], grads["fla"]):
             torch.testing.assert_close(fla_grad, naive_grad, atol=8e-2, rtol=8e-2)
+
+    def test_fla_multi_chunk_forward_and_backward_matches_naive_gdn(self):
+        self._assert_fla_multi_chunk_matches_naive("gdn")
+
+    @unittest.skipUnless(
+        fla_available("kda"),
+        "FLA KDA chunk kernel is not installed",
+    )
+    def test_fla_multi_chunk_forward_and_backward_matches_naive_kda(self):
+        self._assert_fla_multi_chunk_matches_naive("kda")
 
 
 if __name__ == "__main__":
