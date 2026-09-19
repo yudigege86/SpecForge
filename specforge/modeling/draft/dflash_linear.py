@@ -8,7 +8,9 @@ instead:
 3. reads that state before building local Q/K/V (context-first);
 4. mixes only inside the B-token block.
 
-Serving / ``spec_generate`` is out of this milestone.
+Serving uses ``spec_generate``: one B-token block at the current decode
+position, with a full-prefix GDN/KDA scan instead of concatenated draft KV.
+Stock SGLang ``--speculative-algorithm DFLASH`` cannot load this architecture.
 """
 
 from __future__ import annotations
@@ -18,12 +20,18 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3.modeling_qwen3 import (
     GradientCheckpointingLayer,
     Qwen3Config,
 )
 
-from .dflash import DFlashDraftModel, apply_rotary_pos_emb
+from .dflash import (
+    DFlashDraftModel,
+    apply_rotary_pos_emb,
+    extract_context_feature,
+    sample,
+)
 from .dflash_kernels import DFlashKernels
 from .linear_context import LinearContextScan, _l2norm
 from .registry import register_draft
@@ -78,6 +86,75 @@ def _reject_linear_sliding_window(config: Qwen3Config) -> None:
             "DFlashLinearDraftModel does not support sliding_attention layers; "
             "the recurrent scan is full-prefix"
         )
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    return next(module.parameters()).device
+
+
+def _input_embeddings(target: nn.Module) -> nn.Module:
+    getter = getattr(target, "get_input_embeddings", None)
+    if callable(getter):
+        embeddings = getter()
+        if embeddings is not None:
+            return embeddings
+    model = getattr(target, "model", None)
+    if model is not None:
+        if hasattr(model, "embed_tokens"):
+            return model.embed_tokens
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "embed_tokens"):
+            return language_model.embed_tokens
+    raise AttributeError("target has no input embeddings")
+
+
+def _lm_head(target: nn.Module) -> nn.Module:
+    head = getattr(target, "lm_head", None)
+    if head is not None:
+        return head
+    language_model = getattr(getattr(target, "model", None), "language_model", None)
+    if language_model is not None:
+        head = getattr(language_model, "lm_head", None)
+        if head is not None:
+            return head
+    return _input_embeddings(target)
+
+
+def _project_logits(head: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    weight = getattr(head, "weight", None)
+    if (
+        weight is not None
+        and hidden.shape[-1] == weight.shape[-1]
+        and not isinstance(head, nn.Embedding)
+    ):
+        return head(hidden)
+    if weight is not None:
+        return F.linear(hidden, weight)
+    return head(hidden)
+
+
+def _forward_target(
+    target: nn.Module,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    past_key_values,
+    *,
+    logits_to_keep: Optional[int] = None,
+):
+    kwargs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "past_key_values": past_key_values,
+        "use_cache": True,
+        "output_hidden_states": True,
+    }
+    if logits_to_keep is not None:
+        kwargs["logits_to_keep"] = logits_to_keep
+    try:
+        return target(**kwargs)
+    except TypeError:
+        kwargs.pop("logits_to_keep", None)
+        return target(**kwargs)
 
 
 def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -423,13 +500,221 @@ class DFlashLinearDraftModel(DFlashDraftModel):
             )
         return self.norm(hidden_states)
 
-    @torch.inference_mode()
-    def spec_generate(self, *args, **kwargs):
-        del args, kwargs
-        raise NotImplementedError(
-            "Linear-context DFlash serving is not implemented; this milestone "
-            "is training and acceptance metrics only"
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        del block_output_ids
+        draft_logits = _project_logits(
+            _lm_head(target), draft_hidden[:, -self.block_size + 1 :, :]
         )
+        return sample(draft_logits)
+
+    @torch.inference_mode()
+    def spec_generate(
+        self,
+        target: nn.Module,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int,
+        stop_token_ids: list[int],
+        temperature: float,
+    ):
+        """Draft one B-token block from prefix state ``S_{p-1}``, then verify.
+
+        Unlike stock DFlash, context is not cached as draft KV. Each step scans
+        the full verified target-feature prefix and gathers one anchor at the
+        current decode position.
+        """
+        self.eval()
+        self.last_acceptance_lengths = []
+        device = _module_device(target)
+        embed_tokens = _input_embeddings(target)
+        num_input_tokens = input_ids.shape[1]
+        max_length = num_input_tokens + max_new_tokens
+        block_size = self.block_size
+        output_ids = torch.full(
+            (1, max_length + block_size),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        position_ids = torch.arange(
+            output_ids.shape[1], device=device
+        ).unsqueeze(0)
+        past_key_values_target = DynamicCache()
+
+        output = _forward_target(
+            target,
+            input_ids,
+            position_ids[:, :num_input_tokens],
+            past_key_values_target,
+            logits_to_keep=1,
+        )
+        output_ids[:, :num_input_tokens] = input_ids
+        output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(
+            output.logits if output.logits.ndim == 3 else output.logits.unsqueeze(1),
+            temperature,
+        )
+        prefix_hidden = extract_context_feature(
+            output.hidden_states, self.target_layer_ids
+        )
+
+        acceptance_lengths = []
+        start = input_ids.shape[1]
+        while start < max_length:
+            block_output_ids = output_ids[:, start : start + block_size].clone()
+            block_position_ids = position_ids[:, start : start + block_size]
+            noise_embedding = embed_tokens(block_output_ids)
+            anchor_positions = torch.full(
+                (1, 1), start, dtype=torch.long, device=device
+            )
+            draft_hidden = self(
+                target_hidden=prefix_hidden,
+                noise_embedding=noise_embedding,
+                position_ids=block_position_ids,
+                anchor_positions=anchor_positions,
+            )
+            block_output_ids[:, 1:] = self._sample_draft_tokens(
+                target,
+                draft_hidden,
+                block_output_ids,
+            )
+
+            output = _forward_target(
+                target,
+                block_output_ids,
+                block_position_ids,
+                past_key_values_target,
+            )
+            posterior = sample(
+                output.logits if output.logits.ndim == 3 else output.logits.unsqueeze(1),
+                temperature,
+            )
+            acceptance_length = (
+                (block_output_ids[:, 1:] == posterior[:, :-1])
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            output_ids[:, start : start + acceptance_length + 1] = block_output_ids[
+                :, : acceptance_length + 1
+            ]
+            output_ids[:, start + acceptance_length + 1] = posterior[
+                :, acceptance_length
+            ]
+            start += acceptance_length + 1
+            past_key_values_target.crop(start)
+            prefix_hidden = torch.cat(
+                [
+                    prefix_hidden,
+                    extract_context_feature(
+                        output.hidden_states, self.target_layer_ids
+                    )[:, : acceptance_length + 1, :],
+                ],
+                dim=1,
+            )
+            acceptance_lengths.append(acceptance_length + 1)
+            if stop_token_ids is not None and any(
+                stop_token_id in output_ids[:, num_input_tokens:]
+                for stop_token_id in stop_token_ids
+            ):
+                break
+        output_ids = output_ids[:, :max_length]
+        output_ids = output_ids[:, output_ids[0] != self.mask_token_id]
+        if stop_token_ids is not None:
+            stop_token_ids_t = torch.tensor(stop_token_ids, device=output_ids.device)
+            stop_token_indices = torch.isin(
+                output_ids[0][num_input_tokens:], stop_token_ids_t
+            ).nonzero(as_tuple=True)[0]
+            if stop_token_indices.numel() > 0:
+                output_ids = output_ids[
+                    :, : num_input_tokens + stop_token_indices[0] + 1
+                ]
+
+        self.last_acceptance_lengths = acceptance_lengths
+        return output_ids
+
+    @torch.inference_mode()
+    def acceptance_along_sequence(
+        self,
+        target: nn.Module,
+        sequence_ids: torch.LongTensor,
+        prompt_len: int,
+        temperature: float = 0.0,
+    ) -> list[int]:
+        """Teacher-forced block MAL on a frozen target trajectory.
+
+        Avoids incremental target KV cache: one full ``use_cache=False``
+        forward supplies prefix features, then each draft block is scored
+        against the remaining greedy tokens. Use this when the target is a
+        hybrid model whose cache is not ``DynamicCache``.
+        """
+        del temperature
+        self.eval()
+        if sequence_ids.ndim != 2 or sequence_ids.shape[0] != 1:
+            raise ValueError(
+                "acceptance_along_sequence expects sequence_ids of shape [1, L], "
+                f"got {tuple(sequence_ids.shape)}"
+            )
+        seq_len = int(sequence_ids.shape[1])
+        if prompt_len < 1 or prompt_len > seq_len:
+            raise ValueError(
+                f"prompt_len={prompt_len} is outside sequence length {seq_len}"
+            )
+        output = target(
+            input_ids=sequence_ids,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+        if hidden.shape[1] != seq_len:
+            raise ValueError(
+                "target hidden length does not match sequence: "
+                f"{tuple(hidden.shape)} vs L={seq_len}"
+            )
+        embed_tokens = _input_embeddings(target)
+        device = sequence_ids.device
+        block_size = self.block_size
+        position_ids = torch.arange(seq_len + block_size, device=device).unsqueeze(0)
+        acceptance_lengths: list[int] = []
+        start = prompt_len
+        while start < seq_len:
+            remaining = seq_len - start
+            block_ids = torch.full(
+                (1, block_size),
+                self.mask_token_id,
+                dtype=sequence_ids.dtype,
+                device=device,
+            )
+            take = min(block_size, remaining)
+            block_ids[:, :take] = sequence_ids[:, start : start + take]
+            n_draft = min(block_size - 1, remaining - 1)
+            if n_draft <= 0:
+                acceptance_lengths.append(1)
+                start += 1
+                continue
+            draft_hidden = self(
+                target_hidden=hidden[:, :start, :],
+                noise_embedding=embed_tokens(block_ids),
+                position_ids=position_ids[:, start : start + block_size],
+                anchor_positions=torch.full(
+                    (1, 1), start, dtype=torch.long, device=device
+                ),
+            )
+            drafted = self._sample_draft_tokens(target, draft_hidden, block_ids)
+            target_suffix = sequence_ids[:, start + 1 : start + 1 + n_draft]
+            acceptance_length = int(
+                (drafted[:, :n_draft] == target_suffix)
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            acceptance_lengths.append(acceptance_length + 1)
+            start += acceptance_length + 1
+        self.last_acceptance_lengths = acceptance_lengths
+        return acceptance_lengths
 
 
 __all__ = [

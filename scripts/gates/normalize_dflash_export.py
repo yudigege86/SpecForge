@@ -15,6 +15,7 @@ _DSPARK_TOP_LEVEL_FIELDS = (
     "confidence_head_with_markov",
 )
 _DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
+_DFLASH_LINEAR_ARCHITECTURE = "DFlashLinearDraftModel"
 _DFLASH2_FIELDS = (
     "conv_group_size",
     "conv_kernel_size",
@@ -25,6 +26,19 @@ _DFLASH2_FIELDS = (
 
 def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _normalize_dflash_linear(
+    config: Dict[str, Any], method_config: Dict[str, Any]
+) -> None:
+    """Keep the linear draft class; SGLang's stock DFLASH loader cannot serve it."""
+
+    linear = method_config.get("linear_context")
+    if not isinstance(linear, dict) or not linear:
+        raise ValueError(
+            "DFlashLinear export requires a non-empty dflash_config.linear_context"
+        )
+    config["architectures"] = [_DFLASH_LINEAR_ARCHITECTURE]
 
 
 def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
@@ -126,13 +140,18 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
             f"got dflash_config.attention_mode={attention_mode!r}"
         )
 
-    if projector_type == "dspark":
+    keep_auto_map = False
+    if _DFLASH_LINEAR_ARCHITECTURE in (config.get("architectures") or []):
+        _normalize_dflash_linear(config, method_config)
+        keep_auto_map = True
+    elif projector_type == "dspark":
         _normalize_dspark(config, method_config)
     elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
         _normalize_dflash2(config, method_config)
     else:
         config["architectures"] = ["DFlashDraftModel"]
-    config.pop("auto_map", None)
+    if not keep_auto_map:
+        config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
         handle.write("\n")

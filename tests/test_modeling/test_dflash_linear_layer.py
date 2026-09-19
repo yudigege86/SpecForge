@@ -149,10 +149,67 @@ class DFlashLinearLayerTest(unittest.TestCase):
             )
         torch.testing.assert_close(perturbed, baseline, atol=0, rtol=0)
 
-    def test_spec_generate_is_deferred(self):
+    def test_spec_generate_decode_smoke(self):
+        torch.manual_seed(3)
+        from transformers import Qwen3Config
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+        target_config = Qwen3Config(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            vocab_size=256,
+            tie_word_embeddings=False,
+        )
+        target_config._attn_implementation = "sdpa"
+        target = Qwen3ForCausalLM(target_config).eval()
         model = _tiny_model()
-        with self.assertRaises(NotImplementedError):
-            model.spec_generate()
+        model.eval()
+        input_ids = torch.randint(1, 256, (1, 6))
+        output_ids = model.spec_generate(
+            target,
+            input_ids,
+            max_new_tokens=8,
+            stop_token_ids=None,
+            temperature=0.0,
+        )
+        self.assertEqual(output_ids.shape[0], 1)
+        self.assertLessEqual(output_ids.shape[1], input_ids.shape[1] + 8)
+        self.assertTrue(torch.equal(output_ids[:, :6], input_ids))
+        self.assertTrue(model.last_acceptance_lengths)
+        self.assertTrue(all(length >= 1 for length in model.last_acceptance_lengths))
+
+    def test_acceptance_along_sequence_does_not_use_kv_cache(self):
+        torch.manual_seed(4)
+        from transformers import Qwen3Config
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+        target_config = Qwen3Config(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            vocab_size=256,
+            tie_word_embeddings=False,
+        )
+        target_config._attn_implementation = "sdpa"
+        target = Qwen3ForCausalLM(target_config).eval()
+        model = _tiny_model()
+        model.eval()
+        sequence_ids = torch.randint(1, 256, (1, 14))
+        lengths = model.acceptance_along_sequence(
+            target, sequence_ids, prompt_len=6, temperature=0.0
+        )
+        self.assertTrue(lengths)
+        self.assertTrue(all(length >= 1 for length in lengths))
+        self.assertEqual(sum(lengths), sequence_ids.shape[1] - 6)
 
     def test_kda_uses_channelwise_decay_and_forwards(self):
         model = _tiny_model(variant="kda")
