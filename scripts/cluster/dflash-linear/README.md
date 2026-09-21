@@ -23,3 +23,23 @@ python scripts/eval/dflash_linear_serve.py mal \
 HTTP serve/eval (vanilla vs spec_generate) is the same module: `serve`, `eval`,
 `compare`. Stock SGLang `--speculative-algorithm DFLASH` cannot load
 `DFlashLinearDraftModel`.
+
+Capture replay (training forward on SGLang `.ckpt` features, no HF hidden
+states):
+
+```bash
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-replay.sbatch
+```
+
+```bash
+python scripts/eval/dflash_linear_capture_replay.py \
+  --draft /path/to/draft_hf \
+  --hidden-states-path /shared_nfs/naqin/primus-specforge-smoke/qwen-capture-40k/valid-links \
+  --out replay.json --n 32
+```
+
+Feature A/B (same `input_ids`, capture vs HuggingFace `hidden_states`):
+
+```bash
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-feature-ab.sbatch
+```

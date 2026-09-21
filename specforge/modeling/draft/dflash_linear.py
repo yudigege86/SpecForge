@@ -682,14 +682,15 @@ class DFlashLinearDraftModel(DFlashDraftModel):
         start = prompt_len
         while start < seq_len:
             remaining = seq_len - start
+            # Training fills only the current token; the rest of the block is
+            # the mask token. Do not leak the greedy suffix into embeddings.
             block_ids = torch.full(
                 (1, block_size),
                 self.mask_token_id,
                 dtype=sequence_ids.dtype,
                 device=device,
             )
-            take = min(block_size, remaining)
-            block_ids[:, :take] = sequence_ids[:, start : start + take]
+            block_ids[:, 0] = sequence_ids[:, start]
             n_draft = min(block_size - 1, remaining - 1)
             if n_draft <= 0:
                 acceptance_lengths.append(1)

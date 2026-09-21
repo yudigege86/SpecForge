@@ -211,6 +211,50 @@ class DFlashLinearLayerTest(unittest.TestCase):
         self.assertTrue(all(length >= 1 for length in lengths))
         self.assertEqual(sum(lengths), sequence_ids.shape[1] - 6)
 
+    def test_acceptance_along_sequence_masks_future_block_tokens(self):
+        torch.manual_seed(5)
+        from transformers import Qwen3Config
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
+
+        from specforge.modeling.draft.dflash_linear import _input_embeddings
+
+        target_config = Qwen3Config(
+            hidden_size=64,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            head_dim=16,
+            max_position_embeddings=128,
+            vocab_size=256,
+            tie_word_embeddings=False,
+        )
+        target_config._attn_implementation = "sdpa"
+        target = Qwen3ForCausalLM(target_config).eval()
+        model = _tiny_model()
+        model.eval()
+        sequence_ids = torch.randint(1, 256, (1, 14))
+        captured = []
+        original_forward = model.forward
+
+        def wrapped_forward(*args, **kwargs):
+            captured.append(kwargs["noise_embedding"].detach().clone())
+            return original_forward(*args, **kwargs)
+
+        model.forward = wrapped_forward
+        model.acceptance_along_sequence(
+            target, sequence_ids, prompt_len=6, temperature=0.0
+        )
+        self.assertTrue(captured)
+        embed = _input_embeddings(target)
+        expected_ids = torch.full(
+            (1, TINY["block_size"]),
+            model.mask_token_id,
+            dtype=sequence_ids.dtype,
+        )
+        expected_ids[:, 0] = sequence_ids[:, 6]
+        torch.testing.assert_close(captured[0], embed(expected_ids))
+
     def test_kda_uses_channelwise_decay_and_forwards(self):
         model = _tiny_model(variant="kda")
         layer = model.layers[0]
