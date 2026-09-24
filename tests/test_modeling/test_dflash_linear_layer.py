@@ -216,7 +216,7 @@ class DFlashLinearLayerTest(unittest.TestCase):
         from transformers import Qwen3Config
         from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 
-        from specforge.modeling.draft.dflash_linear import _input_embeddings
+        from specforge.modeling.draft.dflash import target_input_embeddings
 
         target_config = Qwen3Config(
             hidden_size=64,
@@ -246,7 +246,7 @@ class DFlashLinearLayerTest(unittest.TestCase):
             target, sequence_ids, prompt_len=6, temperature=0.0
         )
         self.assertTrue(captured)
-        embed = _input_embeddings(target)
+        embed = target_input_embeddings(target)
         expected_ids = torch.full(
             (1, TINY["block_size"]),
             model.mask_token_id,

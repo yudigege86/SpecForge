@@ -30,7 +30,10 @@ from .dflash import (
     DFlashDraftModel,
     apply_rotary_pos_emb,
     extract_context_feature,
+    project_draft_logits,
     sample,
+    target_input_embeddings,
+    target_lm_head,
 )
 from .dflash_kernels import DFlashKernels
 from .linear_context import LinearContextScan, _l2norm
@@ -92,45 +95,9 @@ def _module_device(module: nn.Module) -> torch.device:
     return next(module.parameters()).device
 
 
-def _input_embeddings(target: nn.Module) -> nn.Module:
-    getter = getattr(target, "get_input_embeddings", None)
-    if callable(getter):
-        embeddings = getter()
-        if embeddings is not None:
-            return embeddings
-    model = getattr(target, "model", None)
-    if model is not None:
-        if hasattr(model, "embed_tokens"):
-            return model.embed_tokens
-        language_model = getattr(model, "language_model", None)
-        if language_model is not None and hasattr(language_model, "embed_tokens"):
-            return language_model.embed_tokens
-    raise AttributeError("target has no input embeddings")
-
-
-def _lm_head(target: nn.Module) -> nn.Module:
-    head = getattr(target, "lm_head", None)
-    if head is not None:
-        return head
-    language_model = getattr(getattr(target, "model", None), "language_model", None)
-    if language_model is not None:
-        head = getattr(language_model, "lm_head", None)
-        if head is not None:
-            return head
-    return _input_embeddings(target)
-
-
-def _project_logits(head: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
-    weight = getattr(head, "weight", None)
-    if (
-        weight is not None
-        and hidden.shape[-1] == weight.shape[-1]
-        and not isinstance(head, nn.Embedding)
-    ):
-        return head(hidden)
-    if weight is not None:
-        return F.linear(hidden, weight)
-    return head(hidden)
+_input_embeddings = target_input_embeddings
+_lm_head = target_lm_head
+_project_logits = project_draft_logits
 
 
 def _forward_target(
@@ -500,17 +467,22 @@ class DFlashLinearDraftModel(DFlashDraftModel):
             )
         return self.norm(hidden_states)
 
-    def _sample_draft_tokens(
+    def _teacher_force_block(
         self,
-        target: nn.Module,
-        draft_hidden: torch.Tensor,
-        block_output_ids: torch.LongTensor,
-    ) -> torch.LongTensor:
-        del block_output_ids
-        draft_logits = _project_logits(
-            _lm_head(target), draft_hidden[:, -self.block_size + 1 :, :]
+        *,
+        target_hidden: torch.Tensor,
+        noise_embedding: torch.Tensor,
+        position_ids: torch.Tensor,
+        start: int,
+    ) -> torch.Tensor:
+        return self(
+            target_hidden=target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=position_ids,
+            anchor_positions=torch.full(
+                (1, 1), start, dtype=torch.long, device=position_ids.device
+            ),
         )
-        return sample(draft_logits)
 
     @torch.inference_mode()
     def spec_generate(
@@ -635,87 +607,6 @@ class DFlashLinearDraftModel(DFlashDraftModel):
 
         self.last_acceptance_lengths = acceptance_lengths
         return output_ids
-
-    @torch.inference_mode()
-    def acceptance_along_sequence(
-        self,
-        target: nn.Module,
-        sequence_ids: torch.LongTensor,
-        prompt_len: int,
-        temperature: float = 0.0,
-    ) -> list[int]:
-        """Teacher-forced block MAL on a frozen target trajectory.
-
-        Avoids incremental target KV cache: one full ``use_cache=False``
-        forward supplies prefix features, then each draft block is scored
-        against the remaining greedy tokens. Use this when the target is a
-        hybrid model whose cache is not ``DynamicCache``.
-        """
-        del temperature
-        self.eval()
-        if sequence_ids.ndim != 2 or sequence_ids.shape[0] != 1:
-            raise ValueError(
-                "acceptance_along_sequence expects sequence_ids of shape [1, L], "
-                f"got {tuple(sequence_ids.shape)}"
-            )
-        seq_len = int(sequence_ids.shape[1])
-        if prompt_len < 1 or prompt_len > seq_len:
-            raise ValueError(
-                f"prompt_len={prompt_len} is outside sequence length {seq_len}"
-            )
-        output = target(
-            input_ids=sequence_ids,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
-        if hidden.shape[1] != seq_len:
-            raise ValueError(
-                "target hidden length does not match sequence: "
-                f"{tuple(hidden.shape)} vs L={seq_len}"
-            )
-        embed_tokens = _input_embeddings(target)
-        device = sequence_ids.device
-        block_size = self.block_size
-        position_ids = torch.arange(seq_len + block_size, device=device).unsqueeze(0)
-        acceptance_lengths: list[int] = []
-        start = prompt_len
-        while start < seq_len:
-            remaining = seq_len - start
-            # Training fills only the current token; the rest of the block is
-            # the mask token. Do not leak the greedy suffix into embeddings.
-            block_ids = torch.full(
-                (1, block_size),
-                self.mask_token_id,
-                dtype=sequence_ids.dtype,
-                device=device,
-            )
-            block_ids[:, 0] = sequence_ids[:, start]
-            n_draft = min(block_size - 1, remaining - 1)
-            if n_draft <= 0:
-                acceptance_lengths.append(1)
-                start += 1
-                continue
-            draft_hidden = self(
-                target_hidden=hidden[:, :start, :],
-                noise_embedding=embed_tokens(block_ids),
-                position_ids=position_ids[:, start : start + block_size],
-                anchor_positions=torch.full(
-                    (1, 1), start, dtype=torch.long, device=device
-                ),
-            )
-            drafted = self._sample_draft_tokens(target, draft_hidden, block_ids)
-            target_suffix = sequence_ids[:, start + 1 : start + 1 + n_draft]
-            acceptance_length = int(
-                (drafted[:, :n_draft] == target_suffix)
-                .cumprod(dim=1)
-                .sum(dim=1)[0]
-                .item()
-            )
-            acceptance_lengths.append(acceptance_length + 1)
-            start += acceptance_length + 1
-        self.last_acceptance_lengths = acceptance_lengths
-        return acceptance_lengths
 
 
 __all__ = [
