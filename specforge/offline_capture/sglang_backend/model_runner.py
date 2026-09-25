@@ -3,7 +3,6 @@ import os
 
 import torch
 from sglang.srt.distributed import (
-    get_attn_tp_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -11,6 +10,13 @@ from sglang.srt.distributed import (
     set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
+
+try:
+    from sglang.srt.distributed import get_attn_tp_group
+except ImportError:  # SGLang 0.5.14
+    from sglang.srt.layers.dp_attention import (
+        get_attention_tp_group as get_attn_tp_group,
+    )
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -30,6 +36,11 @@ _is_cpu_amx_available = cpu_has_amx_support()
 logger = logging.getLogger(__name__)
 
 
+def _parallel(runner):
+    """SGLang 0.5.18 stores ranks on ``runner.ps``; 0.5.14 keeps them on self."""
+    return getattr(runner, "ps", None) or runner
+
+
 class SGLangRunner(ModelRunner):
 
     def init_torch_distributed(self):
@@ -39,7 +50,7 @@ class SGLangRunner(ModelRunner):
             torch.get_device_module(self.device).set_device(self.gpu_id)
         except Exception:
             logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.ps.tp_rank=} {self.ps.tp_size=}"
+                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {_parallel(self).tp_rank=} {_parallel(self).tp_size=}"
             )
             raise
 
@@ -84,12 +95,14 @@ class SGLangRunner(ModelRunner):
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
                     # Set local size to hint SGLang to use shared memory based AllReduce
-                    os.environ["LOCAL_SIZE"] = str(self.ps.tp_size)
-                    torch.ops.sgl_kernel.initialize(self.ps.tp_size, self.ps.tp_rank)
+                    os.environ["LOCAL_SIZE"] = str(_parallel(self).tp_size)
+                    torch.ops.sgl_kernel.initialize(
+                        _parallel(self).tp_size, _parallel(self).tp_rank
+                    )
 
                     @torch.library.register_fake("sgl_kernel::shm_allgather")
                     def _(data, dim):
-                        return torch.cat([data] * self.ps.tp_size, dim=dim)
+                        return torch.cat([data] * _parallel(self).tp_size, dim=dim)
 
                 else:
                     logger.warning(
@@ -99,17 +112,18 @@ class SGLangRunner(ModelRunner):
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
                 backend=backend,
-                world_size=self.ps.tp_size * self.ps.pp_size,
-                rank=self.ps.tp_size * self.ps.pp_rank + self.ps.tp_rank,
+                world_size=_parallel(self).tp_size * _parallel(self).pp_size,
+                rank=_parallel(self).tp_size * _parallel(self).pp_rank
+                + _parallel(self).tp_rank,
                 local_rank=self.gpu_id,
             )
             dp_size = getattr(self.server_args, "dp_size", 1)
             attn_cp_size = getattr(self.server_args, "attn_cp_size", 1)
             moe_dp_size = getattr(self.server_args, "moe_dp_size", 1)
             initialize_model_parallel(
-                tensor_model_parallel_size=self.ps.tp_size,
-                pipeline_model_parallel_size=self.ps.pp_size,
-                expert_model_parallel_size=self.ps.moe_ep_size,
+                tensor_model_parallel_size=_parallel(self).tp_size,
+                pipeline_model_parallel_size=_parallel(self).pp_size,
+                expert_model_parallel_size=_parallel(self).moe_ep_size,
                 attention_data_parallel_size=dp_size,
                 attention_context_model_parallel_size=attn_cp_size,
                 moe_data_model_parallel_size=moe_dp_size,
@@ -133,7 +147,7 @@ class SGLangRunner(ModelRunner):
 
         # Check memory for tensor parallelism
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
-        if self.ps.tp_size > 1 and not self.is_draft_worker:
+        if _parallel(self).tp_size > 1 and not self.is_draft_worker:
             if min_per_gpu_memory < local_gpu_memory * 0.9:
                 if get_bool_env_var("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK"):
                     logger.warning(

@@ -11,7 +11,10 @@ from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     compute_dp_attention_world_info,
 )
-from sglang.srt.runtime_context import get_flags
+try:
+    from sglang.srt.runtime_context import get_flags
+except ImportError:  # SGLang 0.5.14 (cluster image) has no runtime flags
+    get_flags = None
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
@@ -344,11 +347,15 @@ def initialize_dp_attention(
 
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
 
-    dp_flags = get_flags().dp
-    dp_flags.enabled = enable_dp_attention
-    dp_flags.max_len_with_idle = (
-        getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
-    )
+    if get_flags is not None:
+        dp_flags = get_flags().dp
+        dp_flags.enabled = enable_dp_attention
+        dp_flags.max_len_with_idle = (
+            getattr(model_config.hf_config, "hybrid_override_pattern", None)
+            is not None
+        )
+    else:
+        dp_attention._ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
 
     (
         _,
@@ -358,7 +365,31 @@ def initialize_dp_attention(
     ) = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    dp_attention._ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
+    if get_flags is None:
+        moe_dense_tp_size = getattr(server_args, "moe_dense_tp_size", None)
+        try:
+            from sglang.srt.layers.dp_attention import (
+                compute_dp_attention_local_info,
+            )
+
+            _, _, dp_attention._LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
+                enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
+            )
+        except Exception:
+            pass
+        if enable_dp_attention:
+            dp_attention._ATTN_DP_SIZE = dp_size
+            if moe_dense_tp_size is None:
+                dp_attention._LOCAL_ATTN_DP_SIZE = dp_attention._ATTN_DP_SIZE
+            else:
+                dp_attention._LOCAL_ATTN_DP_SIZE = max(
+                    1, dp_size // (tp_size // moe_dense_tp_size)
+                )
+        else:
+            dp_attention._ATTN_DP_SIZE = 1
+            dp_attention._LOCAL_ATTN_DP_SIZE = 1
+    else:
+        dp_attention._ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,

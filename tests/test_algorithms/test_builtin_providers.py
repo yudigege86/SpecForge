@@ -22,7 +22,15 @@ from specforge.algorithms.common.providers import (
 from specforge.algorithms.contracts import AlgorithmSpec, FeatureMode
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-BUILTINS = ("dflash", "domino", "dspark", "eagle3", "mtp", "peagle")
+BUILTINS = (
+    "dflash",
+    "dflash_linear",
+    "domino",
+    "dspark",
+    "eagle3",
+    "mtp",
+    "peagle",
+)
 
 
 class BuiltinProviderContractTest(unittest.TestCase):
@@ -56,7 +64,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 self.assertEqual(contract_keys, provider_keys)
 
     def test_dflash_family_requires_a_trainable_block_size(self):
-        for algorithm in ("dflash", "domino", "dspark"):
+        for algorithm in ("dflash", "dflash_linear", "domino", "dspark"):
             minimum_loss_tokens = self.registry.resolve(
                 algorithm
             ).providers.model.minimum_loss_tokens
@@ -173,7 +181,25 @@ class BuiltinProviderContractTest(unittest.TestCase):
         )
         config = SimpleNamespace(training=training)
         draft = SimpleNamespace(
-            config=SimpleNamespace(num_hidden_layers=2),
+            config=SimpleNamespace(
+                num_hidden_layers=2,
+                hidden_size=64,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=16,
+                dflash_config={
+                    "linear_context": {
+                        "variant": "gdn",
+                        "injection": "gated_residual",
+                        "context_residual": True,
+                        "backend": "auto",
+                        "num_heads": 2,
+                        "key_dim": 16,
+                        "value_dim": 16,
+                        "normalize_qk": True,
+                    }
+                },
+            ),
             layers=[object(), object()],
             norm_before_residual=True,
             target_layer_ids=[3, 7],
@@ -210,6 +236,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 mask_token_id=31,
             ),
             "dflash": dflash_family,
+            "dflash_linear": dflash_family,
             "domino": dflash_family,
             "dspark": dflash_family,
             "mtp": SimpleNamespace(),
@@ -237,6 +264,23 @@ class BuiltinProviderContractTest(unittest.TestCase):
                 "dflash_lk_loss_type",
                 "dflash_kl_scale",
                 "dflash_kl_decay",
+            },
+            "dflash_linear": {
+                "dflash_linear_block_size",
+                "dflash_linear_num_anchors",
+                "dflash_linear_loss_type",
+                "dflash_linear_dpace_alpha",
+                "dflash_linear_lk_loss_type",
+                "dflash_linear_kl_scale",
+                "dflash_linear_kl_decay",
+                "dflash_linear_variant",
+                "dflash_linear_injection",
+                "dflash_linear_context_residual",
+                "dflash_linear_backend",
+                "dflash_linear_num_heads",
+                "dflash_linear_key_dim",
+                "dflash_linear_value_dim",
+                "dflash_linear_normalize_qk",
             },
             "domino": {
                 "domino_block_size",
@@ -443,7 +487,7 @@ class BuiltinProviderContractTest(unittest.TestCase):
         code = (
             "import sys; "
             "from specforge.algorithms.builtin import builtin_algorithm_registry; "
-            "r=builtin_algorithm_registry(); assert len(r)==6; "
+            "r=builtin_algorithm_registry(); assert len(r)==7; "
             "assert 'torch' not in sys.modules; "
             "assert 'specforge.training.strategies.registry' not in sys.modules"
         )

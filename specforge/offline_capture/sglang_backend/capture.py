@@ -17,7 +17,6 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
@@ -28,6 +27,11 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
+try:
+    from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+except ImportError:  # SGLang 0.5.14
+    ParallelState = None
 
 from specforge.distributed import get_tp_group
 
@@ -61,6 +65,8 @@ class OfflineSGLangCaptureBackend:
         trust_remote_code: bool = False,
         **kwargs,
     ) -> "OfflineSGLangCaptureBackend":
+        kwargs.setdefault("disable_radix_cache", True)
+        kwargs.setdefault("max_running_requests", 1)
         tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
@@ -75,54 +81,77 @@ class OfflineSGLangCaptureBackend:
         )
 
         tp_rank = dist.get_rank(get_tp_group())
-        attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-            compute_dp_attention_world_info(
-                server_args.enable_dp_attention,
-                tp_rank,
-                server_args.tp_size,
-                server_args.dp_size,
-                server_args.attn_cp_size,
-            )
-        )
-        attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-        moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
-        moe_ep_rank = (
-            tp_rank
-            % (server_args.tp_size // server_args.moe_dp_size)
-            // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
-        )
         gpu_id = torch.cuda.current_device()
-        parallel_state = ParallelState(
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            pp_rank=0,
-            pp_size=1,
-            dp_rank=0,
-            dp_size=server_args.dp_size,
-            attn_tp_rank=attn_tp_rank,
-            attn_tp_size=attn_tp_size,
-            attn_cp_rank=attn_cp_rank,
-            attn_cp_size=server_args.attn_cp_size,
-            attn_dcp_rank=tp_rank % server_args.dcp_size,
-            attn_dcp_size=server_args.dcp_size,
-            attn_dp_rank=attn_dp_rank,
-            attn_dp_size=attn_dp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            moe_dp_rank=moe_dp_rank,
-            moe_dp_size=server_args.moe_dp_size,
-            gpu_id=gpu_id,
-        )
         model_config = ModelConfig.from_server_args(server_args)
-        model_runner = SGLangRunner(
-            model_config=model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            ps=parallel_state,
-            server_args=server_args,
-            nccl_port=None,
-            is_draft_worker=False,
-        )
+        model_runner = None
+        if ParallelState is not None:
+            try:
+                attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+                    compute_dp_attention_world_info(
+                        server_args.enable_dp_attention,
+                        tp_rank,
+                        server_args.tp_size,
+                        server_args.dp_size,
+                        getattr(server_args, "attn_cp_size", 1),
+                    )
+                )
+                attn_cp_size = getattr(server_args, "attn_cp_size", 1)
+                attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
+                moe_dp_size = getattr(server_args, "moe_dp_size", 1)
+                moe_dp_rank = tp_rank // (server_args.tp_size // moe_dp_size)
+                moe_ep_rank = (
+                    tp_rank
+                    % (server_args.tp_size // moe_dp_size)
+                    // (server_args.tp_size // moe_dp_size // server_args.ep_size)
+                )
+                parallel_state = ParallelState(
+                    tp_rank=tp_rank,
+                    tp_size=server_args.tp_size,
+                    pp_rank=0,
+                    pp_size=1,
+                    dp_rank=0,
+                    dp_size=server_args.dp_size,
+                    attn_tp_rank=attn_tp_rank,
+                    attn_tp_size=attn_tp_size,
+                    attn_cp_rank=attn_cp_rank,
+                    attn_cp_size=attn_cp_size,
+                    attn_dcp_rank=tp_rank % getattr(server_args, "dcp_size", 1),
+                    attn_dcp_size=getattr(server_args, "dcp_size", 1),
+                    attn_dp_rank=attn_dp_rank,
+                    attn_dp_size=attn_dp_size,
+                    moe_ep_rank=moe_ep_rank,
+                    moe_ep_size=server_args.ep_size,
+                    moe_dp_rank=moe_dp_rank,
+                    moe_dp_size=moe_dp_size,
+                    gpu_id=gpu_id,
+                )
+                model_runner = SGLangRunner(
+                    model_config=model_config,
+                    mem_fraction_static=server_args.mem_fraction_static,
+                    gpu_id=gpu_id,
+                    ps=parallel_state,
+                    server_args=server_args,
+                    nccl_port=None,
+                    is_draft_worker=False,
+                )
+            except TypeError:
+                model_runner = None
+        if model_runner is None:
+            moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
+            model_runner = SGLangRunner(
+                model_config=model_config,
+                mem_fraction_static=server_args.mem_fraction_static,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                tp_size=server_args.tp_size,
+                moe_ep_rank=moe_ep_rank,
+                moe_ep_size=server_args.ep_size,
+                pp_rank=0,
+                pp_size=1,
+                server_args=server_args,
+                nccl_port=None,
+                is_draft_worker=False,
+            )
         model_runner.alloc_memory_pool()
         model_runner.init_attention_backends()
         model_runner.init_cuda_graphs()
@@ -166,21 +195,29 @@ class OfflineSGLangCaptureBackend:
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
         if require_mlp_sync(self.model_runner.server_args):
-            prepare_mlp_sync_batch_raw(
-                batch,
-                model_runner=self.model_runner,
-                dp_size=self.model_runner.server_args.dp_size,
-                attn_tp_size=1,
-                attn_cp_size=getattr(self.model_runner.server_args, "attn_cp_size", 1),
-                tp_group=self.model_runner.tp_group,
-                get_idle_batch=None,
-                disable_cuda_graph=self.model_runner.server_args.disable_cuda_graph,
-                require_mlp_tp_gather=require_mlp_tp_gather(
+            kwargs = {
+                "dp_size": self.model_runner.server_args.dp_size,
+                "attn_tp_size": 1,
+                "attn_cp_size": getattr(
+                    self.model_runner.server_args, "attn_cp_size", 1
+                ),
+                "tp_group": self.model_runner.tp_group,
+                "get_idle_batch": None,
+                "disable_cuda_graph": self.model_runner.server_args.disable_cuda_graph,
+                "require_mlp_tp_gather": require_mlp_tp_gather(
                     self.model_runner.server_args
                 ),
-                disable_overlap_schedule=self.model_runner.server_args.disable_overlap_schedule,
-                offload_tags=set(),
-            )
+                "disable_overlap_schedule": (
+                    self.model_runner.server_args.disable_overlap_schedule
+                ),
+                "offload_tags": set(),
+                "model_runner": self.model_runner,
+            }
+            try:
+                prepare_mlp_sync_batch_raw(batch, **kwargs)
+            except TypeError:
+                kwargs.pop("model_runner", None)
+                prepare_mlp_sync_batch_raw(batch, **kwargs)
 
     @torch.no_grad()
     def _forward_extend(self, reqs: list[Req]):
@@ -207,12 +244,15 @@ class OfflineSGLangCaptureBackend:
             )
             batch.prefill_input_ids_cpu = None
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        forward_batch = ForwardBatch.init_new(
-            batch,
-            self.model_runner,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            return_hidden_states_before_norm=False,
-        )
+        try:
+            forward_batch = ForwardBatch.init_new(
+                batch,
+                self.model_runner,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                return_hidden_states_before_norm=False,
+            )
+        except TypeError:
+            forward_batch = ForwardBatch.init_new(batch, self.model_runner)
         forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
         output = self.model_runner.forward(forward_batch)
         return output.logits_output if hasattr(output, "logits_output") else output
@@ -244,9 +284,13 @@ class OfflineSGLangCaptureBackend:
                 sampling_params=sampling_params,
             )
             req.full_untruncated_fill_ids = array("q", req.origin_input_ids)
-            req.set_extend_range(
-                len(req.prefix_indices), len(req.full_untruncated_fill_ids)
-            )
+            if hasattr(req, "set_extend_range"):
+                req.set_extend_range(
+                    len(req.prefix_indices), len(req.full_untruncated_fill_ids)
+                )
+            else:
+                req.fill_len = len(req.full_untruncated_fill_ids)
+                req.extend_input_len = req.fill_len - len(req.prefix_indices)
             req.logprob_start_len = len(req.origin_input_ids) - 1
             reqs.append(req)
 

@@ -2,10 +2,12 @@ from .base import Eagle3DraftModel
 from .dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
+    context_feature_offset,
     extract_context_feature,
     sample,
 )
 from .dflash2 import DFlash2DraftModel
+from .dflash_linear import DFlashLinearDraftModel
 from .domino import DominoDraftModel
 from .dspark import DSparkDraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
@@ -17,12 +19,14 @@ __all__ = [
     "Eagle3DraftModel",
     "DFlashDraftModel",
     "DFlash2DraftModel",
+    "DFlashLinearDraftModel",
     "DominoDraftModel",
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
     "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
+    "context_feature_offset",
     "extract_context_feature",
     "sample",
     "DRAFT_REGISTRY",
