@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import tempfile
 import unittest
@@ -23,6 +24,7 @@ assert_no_placeholders = _EVAL.assert_no_placeholders
 clip_completion_at_eos = _EVAL.clip_completion_at_eos
 load_eval_rows = _EVAL.load_eval_rows
 render_prompt = _EVAL.render_prompt
+render_prompt_ids = _EVAL.render_prompt_ids
 select_rows = _EVAL.select_rows
 turns_have_placeholder = _EVAL.turns_have_placeholder
 turns_to_messages = _EVAL.turns_to_messages
@@ -84,6 +86,34 @@ class SpeedBenchEvalHelpersTest(unittest.TestCase):
             Tokenizer(), turns_to_messages(["hello"]), enable_thinking=False
         )
         self.assertEqual(rendered_off, "think=False")
+
+    def test_render_prompt_ids_uses_chat_template_tokenize(self):
+        class Tokenizer:
+            def apply_chat_template(
+                self,
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
+            ):
+                del messages, add_generation_prompt, enable_thinking
+                if tokenize:
+                    return [11, 12, 13]
+                return "decoded"
+
+            def __call__(self, text, return_tensors=None):
+                del text, return_tensors
+                return {"input_ids": [[0, 11, 12, 13]]}
+
+        self.assertEqual(
+            render_prompt_ids(Tokenizer(), turns_to_messages(["hello"])),
+            [11, 12, 13],
+        )
+
+    def test_cmd_mal_direct_path_does_not_retokenize_chat_text(self):
+        source = inspect.getsource(_EVAL.cmd_mal)
+        self.assertIn("render_prompt_ids", source)
+        self.assertNotIn("tokenizer(text", source)
 
     def test_load_eval_rows_rejects_placeholders(self):
         with tempfile.TemporaryDirectory() as tmp:

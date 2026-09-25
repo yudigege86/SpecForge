@@ -135,9 +135,11 @@ def prompt_messages_for_turn(
 ) -> list[dict[str, str]]:
     """Chat messages to score for the next user turn.
 
-    ``concat_user`` (SPEED-Bench, HumanEval) scores every user turn in one
-    prompt. ``mt_bench`` scores one user turn at a time and inserts prior
-    assistant replies between turns.
+    ``concat_user`` (SPEED-Bench Qualitative, HumanEval) concatenates every
+    user turn into one prompt with no assistant replies. That is **not**
+    z-lab's loop, which generates and appends an assistant message after
+    each turn. ``mt_bench`` scores one user turn at a time; default
+    ``mt_bench_turns=first`` matches the z-lab card (turn 1 only).
     """
 
     turns = turns_to_messages(row["turns"])
@@ -833,11 +835,12 @@ def cmd_mal(args: argparse.Namespace) -> int:
 
     def score_messages(messages: list[dict[str, str]]) -> dict[str, Any]:
         nonlocal finished_on_eos, hit_max_new_tokens
-        text = render_prompt(
+        prompt_ids = render_prompt_ids(
             tokenizer, messages, enable_thinking=args.enable_thinking
         )
-        encoded = tokenizer(text, return_tensors="pt")
-        input_ids = encoded["input_ids"].to(device)
+        input_ids = torch.tensor(
+            [prompt_ids], dtype=torch.long, device=device
+        )
         with torch.inference_mode():
             sequence_ids, prompt_len, completion, eos_stop, hit_max = generate_greedy(
                 target,
