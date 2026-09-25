@@ -17,6 +17,7 @@ import tempfile
 import time
 import urllib.request
 from collections import defaultdict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -190,6 +191,48 @@ def render_prompt(
             )
         except TypeError:
             return tokenizer.apply_chat_template(messages, **kwargs)
+
+
+def render_prompt_ids(
+    tokenizer,
+    messages: list[dict[str, str]],
+    *,
+    enable_thinking: bool = True,
+) -> list[int]:
+    kwargs: dict[str, Any] = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "enable_thinking": enable_thinking,
+    }
+    try:
+        ids = tokenizer.apply_chat_template(messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        try:
+            ids = tokenizer.apply_chat_template(
+                messages,
+                chat_template_kwargs={"enable_thinking": enable_thinking},
+                **kwargs,
+            )
+        except TypeError:
+            ids = tokenizer.apply_chat_template(messages, **kwargs)
+    return flatten_token_ids(ids)
+
+
+def flatten_token_ids(ids: Any) -> list[int]:
+    if hasattr(ids, "tolist") and not isinstance(ids, (list, tuple)):
+        ids = ids.tolist()
+    if isinstance(ids, Mapping) and "input_ids" in ids:
+        ids = ids["input_ids"]
+        if hasattr(ids, "tolist") and not isinstance(ids, (list, tuple)):
+            ids = ids.tolist()
+    if isinstance(ids, tuple):
+        ids = list(ids)
+    if isinstance(ids, list) and ids and isinstance(ids[0], (list, tuple)):
+        ids = list(ids[0])
+    if not isinstance(ids, list) or not ids or isinstance(ids[0], str):
+        raise TypeError(f"apply_chat_template tokenize=True returned {type(ids)!r}")
+    return [int(x) for x in ids]
 
 
 def load_eval_rows(path: str) -> list[dict[str, Any]]:
@@ -662,21 +705,51 @@ def cmd_mal(args: argparse.Namespace) -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from specforge.modeling.auto import AutoDraftModel
+    from specforge.modeling.draft.dflash import context_feature_offset
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     if device.type != "cuda":
         raise SystemExit("MAL eval needs a GPU")
-    rows = select_rows(
-        load_eval_rows(args.eval_jsonl),
-        n=args.n,
-        categories=args.categories,
-    )
-    print(
-        f"loading tokenizer {args.target}; n={len(rows)} max_new_tokens={args.max_new_tokens}",
-        flush=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.target, trust_remote_code=True)
+    replay_json = getattr(args, "replay_json", None)
+    feature_source = str(getattr(args, "feature_source", "hf") or "hf").lower()
+    if feature_source not in ("hf", "sglang"):
+        raise SystemExit(f"unknown --feature-source {feature_source!r}")
+    if feature_source == "sglang" and not replay_json:
+        raise SystemExit("mal --feature-source sglang requires --replay-json")
+    replay_features = None
+    if replay_json:
+        rows = load_replay_trajectories(
+            replay_json,
+            n=args.n,
+            categories=args.categories,
+        )
+        print(
+            f"replaying {len(rows)} frozen trajectories from {replay_json}",
+            flush=True,
+        )
+        if feature_source == "sglang":
+            layer_ids = draft_target_layer_ids(args.draft)
+            replay_features = capture_sglang_aux_features(
+                args.target,
+                [row["sequence_ids"] for row in rows],
+                layer_ids,
+            )
+    else:
+        if not args.eval_jsonl:
+            raise SystemExit("mal requires --eval-jsonl or --replay-json")
+        rows = select_rows(
+            load_eval_rows(args.eval_jsonl),
+            n=args.n,
+            categories=args.categories,
+        )
+        print(
+            f"loading tokenizer {args.target}; n={len(rows)} max_new_tokens={args.max_new_tokens}",
+            flush=True,
+        )
+    tokenizer = None
+    if not replay_json:
+        tokenizer = AutoTokenizer.from_pretrained(args.target, trust_remote_code=True)
     print(f"loading target {args.target}", flush=True)
     target = AutoModelForCausalLM.from_pretrained(
         args.target,
@@ -695,13 +768,55 @@ def cmd_mal(args: argparse.Namespace) -> int:
         )
     draft_meta = draft_report_metadata(draft)
     print("draft", json.dumps(draft_meta, default=str), flush=True)
+    raw_offset = getattr(args, "feature_offset", "auto")
+    if raw_offset in (None, "auto"):
+        feature_offset = context_feature_offset(target)
+    else:
+        feature_offset = int(raw_offset)
     print(
+        f"feature_offset={feature_offset} (cli={raw_offset}) feature_source={feature_source} "
         f"enable_thinking={args.enable_thinking} max_new_tokens={args.max_new_tokens} "
-        f"mt_bench_turns={args.mt_bench_turns}",
+        f"mt_bench_turns={args.mt_bench_turns} replay={bool(replay_json)}",
         flush=True,
     )
-    total_units = sum(
-        score_units_for_row(row, mt_bench_turns=args.mt_bench_turns) for row in rows
+    if replay_features:
+        expected_width = int(len(draft.target_layer_ids) * draft.config.hidden_size)
+        widths = {int(feat.shape[-1]) for feat in replay_features}
+        print(
+            f"sglang_aux n={len(replay_features)} widths={sorted(widths)} "
+            f"expected_width={expected_width}",
+            flush=True,
+        )
+        if expected_width not in widths:
+            raise SystemExit(
+                f"SGLang aux width {sorted(widths)} != draft concat width {expected_width}"
+            )
+        with torch.inference_mode():
+            first_ids = torch.tensor(
+                [rows[0]["sequence_ids"]], dtype=torch.long, device=device
+            )
+            hf_out = target(
+                input_ids=first_ids,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            from specforge.modeling.draft.dflash import extract_context_feature
+
+            hf_feat = extract_context_feature(
+                hf_out.hidden_states, draft.target_layer_ids, offset=feature_offset
+            )[0]
+            sg_feat = replay_features[0].to(device=device)
+            seq = min(hf_feat.shape[0], sg_feat.shape[0])
+            print(
+                f"feature_cosine_token_mean seq0={token_cosine_mean(hf_feat[:seq], sg_feat[:seq])}",
+                flush=True,
+            )
+    total_units = (
+        len(rows)
+        if replay_json
+        else sum(
+            score_units_for_row(row, mt_bench_turns=args.mt_bench_turns) for row in rows
+        )
     )
     print(
         f"score_units={total_units} protocol_mix="
@@ -734,7 +849,11 @@ def cmd_mal(args: argparse.Namespace) -> int:
             lengths: list[int] = []
             if completion > 0:
                 lengths = draft.acceptance_along_sequence(
-                    target, sequence_ids, prompt_len=prompt_len, temperature=0.0
+                    target,
+                    sequence_ids,
+                    prompt_len=prompt_len,
+                    temperature=0.0,
+                    feature_offset=feature_offset,
                 )
         if eos_stop:
             finished_on_eos += 1
@@ -755,29 +874,70 @@ def cmd_mal(args: argparse.Namespace) -> int:
             "text": _decode_completion(tokenizer, sequence_ids, prompt_len),
         }
 
-    for row in rows:
-        n_turns = score_units_for_row(row, mt_bench_turns=args.mt_bench_turns)
-        replies: list[str] = []
-        for turn_i in range(n_turns):
-            messages = prompt_messages_for_turn(row, replies)
-            one = score_messages(messages)
-            question_id = row.get("question_id")
-            turn_index = turn_i + 1 if n_turns > 1 else None
-            if n_turns > 1:
-                question_id = f"{question_id}/t{turn_index}"
+    def score_frozen(row: dict[str, Any], target_hidden=None) -> dict[str, Any]:
+        nonlocal finished_on_eos, hit_max_new_tokens
+        sequence_ids = torch.tensor(
+            [row["sequence_ids"]], dtype=torch.long, device=device
+        )
+        prompt_len = int(row["prompt_len"])
+        completion = int(sequence_ids.shape[1] - prompt_len)
+        with torch.inference_mode():
+            lengths: list[int] = []
+            if completion > 0:
+                kwargs = {
+                    "prompt_len": prompt_len,
+                    "temperature": 0.0,
+                    "feature_offset": feature_offset,
+                }
+                if target_hidden is not None:
+                    kwargs["target_hidden"] = target_hidden.to(
+                        device=device, dtype=dtype
+                    ).unsqueeze(0)
+                lengths = draft.acceptance_along_sequence(
+                    target, sequence_ids, **kwargs
+                )
+        eos_stop = bool(row.get("finished_on_eos"))
+        hit_max = bool(row.get("hit_max_new_tokens"))
+        if eos_stop:
+            finished_on_eos += 1
+        if hit_max:
+            hit_max_new_tokens += 1
+        mean_accept = float(statistics.mean(lengths)) if lengths else None
+        if lengths:
+            block_accepts.extend(float(x) for x in lengths)
+        verify_ct = len(lengths)
+        if completion > 0 and verify_ct:
+            mean_accept = float(completion) / float(verify_ct)
+        return {
+            "completion": completion,
+            "lengths": lengths,
+            "mean_accept": mean_accept,
+            "eos_stop": eos_stop,
+            "hit_max": hit_max,
+        }
+
+    if replay_json:
+        for row_i, row in enumerate(rows):
+            hidden = replay_features[row_i] if replay_features is not None else None
+            one = score_frozen(row, target_hidden=hidden)
             scored.append(
                 _pack_scored_row(
                     row,
-                    question_id=question_id,
-                    turn_index=turn_index,
+                    question_id=row.get("question_id"),
+                    turn_index=row.get("turn_index"),
                     completion=one["completion"],
                     mean_accept=one["mean_accept"],
                     lengths=one["lengths"],
                     eos_stop=one["eos_stop"],
                     hit_max=one["hit_max"],
+                    extra={
+                        "sglang_spec_accept_length": row.get("spec_accept_length"),
+                        "sglang_spec_verify_ct": row.get("spec_verify_ct"),
+                        "feature_offset": feature_offset,
+                        "feature_source": feature_source,
+                    },
                 )
             )
-            replies.append(one["text"] or "")
             unit_index += 1
             if unit_index % 8 == 0 or unit_index == 1:
                 so_far = [
@@ -787,17 +947,58 @@ def cmd_mal(args: argparse.Namespace) -> int:
                 ]
                 running = statistics.mean(so_far) if so_far else None
                 print(
-                    f"mal {unit_index}/{total_units} running_mal={running} "
+                    f"replay {unit_index}/{total_units} running_mal={running} "
                     f"last={one['mean_accept']} new_tokens={one['completion']} "
+                    f"sglang={row.get('spec_accept_length')} "
                     f"category={row.get('category')}",
                     flush=True,
                 )
+    else:
+        for row in rows:
+            n_turns = score_units_for_row(row, mt_bench_turns=args.mt_bench_turns)
+            replies: list[str] = []
+            for turn_i in range(n_turns):
+                messages = prompt_messages_for_turn(row, replies)
+                one = score_messages(messages)
+                question_id = row.get("question_id")
+                turn_index = turn_i + 1 if n_turns > 1 else None
+                if n_turns > 1:
+                    question_id = f"{question_id}/t{turn_index}"
+                scored.append(
+                    _pack_scored_row(
+                        row,
+                        question_id=question_id,
+                        turn_index=turn_index,
+                        completion=one["completion"],
+                        mean_accept=one["mean_accept"],
+                        lengths=one["lengths"],
+                        eos_stop=one["eos_stop"],
+                        hit_max=one["hit_max"],
+                    )
+                )
+                replies.append(one["text"] or "")
+                unit_index += 1
+                if unit_index % 8 == 0 or unit_index == 1:
+                    so_far = [
+                        item["spec_accept_length"]
+                        for item in scored
+                        if item["spec_accept_length"] is not None
+                    ]
+                    running = statistics.mean(so_far) if so_far else None
+                    print(
+                        f"mal {unit_index}/{total_units} running_mal={running} "
+                        f"last={one['mean_accept']} new_tokens={one['completion']} "
+                        f"category={row.get('category')}",
+                        flush=True,
+                    )
 
     report = aggregate_mal_report(
         scored,
         block_accepts=block_accepts,
         extra={
-            "label": "offline_mal",
+            "label": "offline_replay_mal" if replay_json else "offline_mal",
+            "backend": "offline_replay" if replay_json else "offline",
+            "replay_json": replay_json,
             "target": args.target,
             "draft": args.draft,
             "eval_jsonl": args.eval_jsonl,
@@ -806,6 +1007,7 @@ def cmd_mal(args: argparse.Namespace) -> int:
             "enable_thinking": args.enable_thinking,
             "mt_bench_turns": args.mt_bench_turns,
             "ignore_eos": args.ignore_eos,
+            "feature_source": feature_source,
             "finished_on_eos": finished_on_eos,
             "hit_max_new_tokens": hit_max_new_tokens,
             "elapsed_s": time.perf_counter() - started,
@@ -862,6 +1064,7 @@ def parse_sglang_generate(
     payload: Any,
     *,
     max_new_tokens: int,
+    prompt_ids: Optional[list[int]] = None,
 ) -> dict[str, Any]:
     if isinstance(payload, list):
         if not payload:
@@ -892,6 +1095,24 @@ def parse_sglang_generate(
     )
     if finished_on_eos:
         hit_max = False
+    raw_ids = extract_sglang_output_ids(payload)
+    split_prompt = _as_int_list(prompt_ids)
+    split_completion: Optional[list[int]] = None
+    if raw_ids:
+        prompt_tokens = meta.get("prompt_tokens")
+        try:
+            prompt_tokens_i = int(prompt_tokens) if prompt_tokens is not None else None
+        except (TypeError, ValueError):
+            prompt_tokens_i = None
+        try:
+            split_prompt, split_completion = split_prompt_and_completion(
+                raw_ids,
+                prompt_ids=split_prompt,
+                prompt_tokens=prompt_tokens_i,
+                completion_tokens=completion or None,
+            )
+        except ValueError:
+            split_completion = None
     return {
         "text": payload.get("text"),
         "completion_tokens": completion,
@@ -900,7 +1121,275 @@ def parse_sglang_generate(
         "finished_on_eos": finished_on_eos,
         "hit_max_new_tokens": hit_max,
         "finish_reason": meta.get("finish_reason"),
+        "prompt_ids": split_prompt,
+        "completion_ids": split_completion,
+        "output_ids": raw_ids,
+        "payload_keys": sorted(str(key) for key in payload.keys()),
     }
+
+
+def _as_int_list(value: Any) -> Optional[list[int]]:
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list):
+        return None
+    if not value:
+        return []
+    first = value[0]
+    if isinstance(first, (list, tuple)) and first:
+        return [int(item[0]) for item in value]
+    return [int(item) for item in value]
+
+
+def extract_sglang_output_ids(payload: dict[str, Any]) -> Optional[list[int]]:
+    meta = payload.get("meta_info") or payload.get("meta") or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    for candidate in (
+        payload.get("output_ids"),
+        payload.get("token_ids"),
+        meta.get("output_ids"),
+        meta.get("output_token_ids"),
+        meta.get("completion_ids"),
+        payload.get("output_token_logprobs"),
+        meta.get("output_token_logprobs"),
+    ):
+        ids = _as_int_list(candidate)
+        if ids:
+            return ids
+    return None
+
+
+def split_prompt_and_completion(
+    output_ids: list[int],
+    *,
+    prompt_ids: Optional[list[int]],
+    prompt_tokens: Optional[int],
+    completion_tokens: Optional[int],
+) -> tuple[list[int], list[int]]:
+    if prompt_ids and output_ids[: len(prompt_ids)] == prompt_ids:
+        return list(prompt_ids), output_ids[len(prompt_ids) :]
+    if prompt_tokens and len(output_ids) >= int(prompt_tokens):
+        prompt = output_ids[: int(prompt_tokens)]
+        completion = output_ids[int(prompt_tokens) :]
+        if completion_tokens is None or len(completion) == int(completion_tokens):
+            return prompt, completion
+    if completion_tokens is not None and len(output_ids) == int(completion_tokens):
+        if not prompt_ids:
+            raise ValueError("completion-only output_ids require prompt_ids")
+        return list(prompt_ids), output_ids
+    if completion_tokens and len(output_ids) > int(completion_tokens):
+        cut = len(output_ids) - int(completion_tokens)
+        return output_ids[:cut], output_ids[cut:]
+    if prompt_ids:
+        return list(prompt_ids), output_ids
+    raise ValueError("could not split prompt and completion token ids")
+
+
+def draft_target_layer_ids(draft_path: str) -> list[int]:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(draft_path, trust_remote_code=True)
+    method = dict(getattr(config, "dflash_config", None) or {})
+    layer_ids = method.get("target_layer_ids")
+    if not layer_ids:
+        raise SystemExit(f"{draft_path} has no dflash_config.target_layer_ids")
+    return [int(x) for x in layer_ids]
+
+
+def normalize_aux_feature(aux: Any, seq_len: int):
+    import torch
+
+    tensor = aux
+    if isinstance(tensor, (list, tuple)):
+        parts = []
+        for item in tensor:
+            item_t = item if torch.is_tensor(item) else torch.as_tensor(item)
+            if item_t.dim() == 3:
+                item_t = item_t.reshape(item_t.shape[-2], item_t.shape[-1])
+            elif item_t.dim() == 1:
+                item_t = item_t.unsqueeze(0)
+            parts.append(item_t)
+        tensor = torch.cat(parts, dim=-1)
+    else:
+        tensor = tensor if torch.is_tensor(tensor) else torch.as_tensor(tensor)
+    if tensor.dim() == 3:
+        if tensor.shape[0] == 1:
+            tensor = tensor[0]
+        elif int(tensor.shape[0]) == int(seq_len):
+            tensor = tensor.reshape(seq_len, -1)
+        else:
+            raise ValueError(
+                f"expected packed aux [1, L, H] or [L, *, *], got {tuple(tensor.shape)}"
+            )
+    if tensor.dim() != 2:
+        raise ValueError(f"aux feature rank {tensor.dim()} shape={tuple(tensor.shape)}")
+    if tensor.shape[0] != seq_len and tensor.shape[1] == seq_len:
+        tensor = tensor.transpose(0, 1).contiguous()
+    if int(tensor.shape[0]) != int(seq_len):
+        raise ValueError(f"aux seq {tensor.shape[0]} != sequence length {seq_len}")
+    return tensor.detach().to("cpu")
+
+
+def _ensure_single_rank_dist() -> None:
+    import os
+    import socket
+
+    import torch.distributed as dist
+
+    from specforge.distributed import get_tp_group, init_distributed
+
+    if get_tp_group() is not None:
+        return
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    if "MASTER_PORT" not in os.environ:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            os.environ["MASTER_PORT"] = str(sock.getsockname()[1])
+    if not dist.is_initialized():
+        init_distributed(tp_size=1)
+
+
+def _bind_dflash_capture_layers(capture, layer_ids: list[int]) -> None:
+    try:
+        capture.set_capture_layers(layer_ids, capture_method="dflash")
+        return
+    except Exception as exc:
+        last = exc
+    root = getattr(getattr(capture, "_backend", None), "model_runner", None)
+    root = getattr(root, "model", None)
+    queue = [root]
+    seen: set[int] = set()
+    while queue:
+        obj = queue.pop(0)
+        if obj is None:
+            continue
+        obj_id = id(obj)
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        setter = getattr(obj, "set_dflash_layers_to_capture", None)
+        if callable(setter):
+            setter(layer_ids)
+            print(f"set_dflash_layers_to_capture on {type(obj).__name__}", flush=True)
+            return
+        for name in ("model", "language_model"):
+            nxt = getattr(obj, name, None)
+            if nxt is not None:
+                queue.append(nxt)
+    raise RuntimeError(
+        f"could not set DFLASH capture layers {layer_ids}: {last}"
+    )
+
+
+def capture_sglang_aux_features(
+    model_path: str,
+    sequences: list[list[int]],
+    layer_ids: list[int],
+    *,
+    mem_fraction_static: float = 0.85,
+) -> list[Any]:
+    import gc
+
+    import torch
+
+    from specforge.offline_capture import OfflineSGLangCapture
+
+    _ensure_single_rank_dist()
+    print(
+        f"loading SGLang capture target {model_path} layers={layer_ids} "
+        f"mem_fraction_static={mem_fraction_static}",
+        flush=True,
+    )
+    capture = OfflineSGLangCapture.from_pretrained(
+        model_path,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        mem_fraction_static=mem_fraction_static,
+        disable_radix_cache=True,
+    )
+    _bind_dflash_capture_layers(capture, list(layer_ids))
+    features = []
+    try:
+        for index, ids in enumerate(sequences):
+            aux_rows, _last = capture.capture_rows([list(map(int, ids))])
+            if not aux_rows:
+                raise RuntimeError("SGLang capture returned no aux rows")
+            feat = normalize_aux_feature(aux_rows[0], len(ids))
+            features.append(feat)
+            print(
+                f"sglang-capture {index + 1}/{len(sequences)} seq={len(ids)} "
+                f"aux={tuple(feat.shape)}",
+                flush=True,
+            )
+    finally:
+        runner = getattr(getattr(capture, "_backend", None), "model_runner", None)
+        if runner is not None and getattr(runner, "model", None) is not None:
+            try:
+                runner.model.to("cpu")
+            except Exception:
+                pass
+            runner.model = None
+        del capture
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return features
+
+
+def token_cosine_mean(left, right) -> float:
+    import torch
+
+    a = left.float().reshape(-1, left.shape[-1])
+    b = right.float().reshape(-1, right.shape[-1])
+    seq = min(a.shape[0], b.shape[0])
+    a = a[:seq]
+    b = b[:seq]
+    denom = a.norm(dim=-1).clamp_min(1e-12) * b.norm(dim=-1).clamp_min(1e-12)
+    return float(((a * b).sum(dim=-1) / denom).mean().item())
+
+
+def load_replay_trajectories(
+    path: str,
+    *,
+    n: Optional[int] = None,
+    categories: Optional[list[str]] = None,
+) -> list[dict[str, Any]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    raw = payload.get("raw") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list) or not raw:
+        raise SystemExit(f"{path} has no raw trajectories")
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            raise SystemExit(f"{path} raw row is {type(row)!r}")
+        prompt_ids = _as_int_list(row.get("prompt_ids"))
+        completion_ids = _as_int_list(row.get("completion_ids"))
+        sequence_ids = _as_int_list(row.get("sequence_ids"))
+        prompt_len = row.get("prompt_len")
+        if sequence_ids and prompt_len is not None:
+            prompt_len_i = int(prompt_len)
+            prompt_ids = sequence_ids[:prompt_len_i]
+            completion_ids = sequence_ids[prompt_len_i:]
+        if prompt_ids is None or completion_ids is None:
+            raise SystemExit(
+                f"{path} row {row.get('question_id')!r} missing prompt_ids/completion_ids"
+            )
+        packed = dict(row)
+        packed["prompt_ids"] = prompt_ids
+        packed["completion_ids"] = completion_ids
+        packed["sequence_ids"] = prompt_ids + completion_ids
+        packed["prompt_len"] = len(prompt_ids)
+        packed["turns"] = packed.get("turns") or [packed.get("text") or "replay"]
+        packed["category"] = packed.get("category") or "unknown"
+        packed["question_id"] = packed.get("question_id")
+        rows.append(packed)
+    return select_rows(rows, n=n, categories=categories)
 
 
 def sglang_is_ready(
@@ -1082,26 +1571,64 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
         text = render_prompt(
             tokenizer, messages, enable_thinking=args.enable_thinking
         )
+        prompt_ids = render_prompt_ids(
+            tokenizer, messages, enable_thinking=args.enable_thinking
+        )
         payload = {
             "text": text,
+            "input_ids": prompt_ids,
+            "stream": False,
             "sampling_params": sglang_sampling_params(
                 max_new_tokens=args.max_new_tokens,
                 ignore_eos=args.ignore_eos,
             ),
         }
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
+        def post(body_payload: dict[str, Any]) -> Any:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
             with urllib.request.urlopen(req, timeout=args.timeout) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
+                return json.loads(resp.read().decode("utf-8"))
+
+        try:
+            body = post(payload)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise SystemExit(f"SGLang generate HTTP {exc.code}: {detail[:2000]}") from exc
-        parsed = parse_sglang_generate(body, max_new_tokens=args.max_new_tokens)
+            if exc.code == 400 and "input_ids" in payload:
+                payload.pop("input_ids", None)
+                try:
+                    body = post(payload)
+                except urllib.error.HTTPError as retry_exc:
+                    retry_detail = retry_exc.read().decode("utf-8", errors="replace")
+                    raise SystemExit(
+                        f"SGLang generate HTTP {retry_exc.code}: {retry_detail[:2000]}"
+                    ) from retry_exc
+            else:
+                raise SystemExit(
+                    f"SGLang generate HTTP {exc.code}: {detail[:2000]}"
+                ) from exc
+        parsed = parse_sglang_generate(
+            body,
+            max_new_tokens=args.max_new_tokens,
+            prompt_ids=prompt_ids,
+        )
+        if not parsed.get("completion_ids"):
+            payload["return_logprob"] = True
+            payload["logprob_start_len"] = 0
+            body = post(payload)
+            parsed = parse_sglang_generate(
+                body,
+                max_new_tokens=args.max_new_tokens,
+                prompt_ids=prompt_ids,
+            )
+        if not parsed.get("completion_ids") or not parsed.get("prompt_ids"):
+            raise SystemExit(
+                "SGLang generate did not return token ids for replay; "
+                f"keys={parsed.get('payload_keys')}"
+            )
         if parsed["finished_on_eos"]:
             finished_on_eos += 1
         if parsed["hit_max_new_tokens"]:
@@ -1133,6 +1660,9 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
                     extra={
                         "spec_verify_ct": parsed["spec_verify_ct"],
                         "n_blocks": parsed["spec_verify_ct"] or 0,
+                        "prompt_ids": parsed["prompt_ids"],
+                        "completion_ids": parsed["completion_ids"],
+                        "prompt_len": len(parsed["prompt_ids"] or []),
                     },
                 )
             )
@@ -1345,7 +1875,19 @@ def build_parser() -> argparse.ArgumentParser:
     mal = sub.add_parser("mal")
     mal.add_argument("--target", required=True)
     mal.add_argument("--draft", required=True)
-    mal.add_argument("--eval-jsonl", required=True)
+    mal.add_argument("--eval-jsonl", default="")
+    mal.add_argument("--replay-json", default=None)
+    mal.add_argument(
+        "--feature-offset",
+        default="auto",
+        help="HF hidden_states index offset. auto: 1 for all targets.",
+    )
+    mal.add_argument(
+        "--feature-source",
+        choices=("hf", "sglang"),
+        default="hf",
+        help="Prefix features for teacher-force: HuggingFace hidden_states or SGLang DFLASH aux capture.",
+    )
     mal.add_argument("--out", required=True)
     mal.add_argument("--summary", default=None)
     mal.add_argument("--n", type=int, default=None)

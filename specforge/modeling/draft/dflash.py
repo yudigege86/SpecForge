@@ -617,16 +617,46 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     return target_layer_ids
 
 
+def context_feature_offset(target) -> int:
+    """HF ``hidden_states`` index offset for DFLASH aux features.
+
+    Layer ``k`` is ``hidden_states[k + offset]``. SpecForge and dense Qwen3
+    SGLang both use ``offset=1`` (embeddings at index 0). Qwen3.5 hybrid
+    SGLang marks layer ``k`` with no +1, but a frozen-id A/B with
+    ``offset=0`` still undercounted live DFLASH MAL, so the default stays 1.
+    """
+
+    del target
+    return 1
+
+
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
+    offset: int = 1,
 ) -> torch.Tensor:
-    offset = 1
+    """Concat target-layer features from a HuggingFace ``hidden_states`` tuple.
+
+    ``offset=1`` is the dense-Qwen3 convention (layer ``k`` at index ``k+1``).
+    Qwen3.5 hybrid SGLang marks layer ``k`` with no +1, but a frozen-id A/B
+    with ``offset=0`` still undercounted live DFLASH; default stays 1.
+    """
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+    if not layer_ids:
+        raise ValueError("layer_ids must be a non-empty list")
+    n_hidden = len(hidden_states)
     selected_states = []
     for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
-    target_hidden = torch.cat(selected_states, dim=-1)
-    return target_hidden
+        index = int(layer_id) + int(offset)
+        if index < 0 or index >= n_hidden:
+            raise IndexError(
+                f"hidden_states[{index}] out of range (n={n_hidden}) for "
+                f"layer_id={layer_id} offset={offset}"
+            )
+        selected_states.append(hidden_states[index])
+    return torch.cat(selected_states, dim=-1)
 
 
 def target_input_embeddings(target: nn.Module) -> nn.Module:
@@ -871,6 +901,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         sequence_ids: torch.LongTensor,
         prompt_len: int,
         temperature: float = 0.0,
+        feature_offset: Optional[int] = None,
+        target_hidden: Optional[torch.Tensor] = None,
     ) -> list[int]:
         """Teacher-forced block MAL on a frozen target trajectory.
 
@@ -878,6 +910,8 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         forward supplies prefix features, then each draft block is scored
         against the remaining greedy tokens. Training-style noise embeds
         only the current token; the rest of the block is the mask token.
+        Pass ``target_hidden`` to reuse captured SGLang aux features instead
+        of HuggingFace ``output.hidden_states``.
         """
         del temperature
         self.eval()
@@ -893,12 +927,32 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             raise ValueError(
                 f"prompt_len={prompt_len} is outside sequence length {seq_len}"
             )
-        output = target(
-            input_ids=sequence_ids,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        hidden = extract_context_feature(output.hidden_states, self.target_layer_ids)
+        if target_hidden is None:
+            output = target(
+                input_ids=sequence_ids,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            if feature_offset is None:
+                feature_offset = context_feature_offset(target)
+            hidden = extract_context_feature(
+                output.hidden_states, self.target_layer_ids, offset=feature_offset
+            )
+        else:
+            hidden = target_hidden
+            if hidden.ndim == 2:
+                hidden = hidden.unsqueeze(0)
+            if hidden.ndim != 3 or hidden.shape[0] != 1:
+                raise ValueError(
+                    "target_hidden must have shape [1, L, H], "
+                    f"got {tuple(hidden.shape)}"
+                )
+            if hidden.device != sequence_ids.device or hidden.dtype != next(
+                self.parameters()
+            ).dtype:
+                hidden = hidden.to(
+                    device=sequence_ids.device, dtype=next(self.parameters()).dtype
+                )
         if hidden.shape[1] != seq_len:
             raise ValueError(
                 "target hidden length does not match sequence: "
@@ -1016,7 +1070,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output.logits, temperature
         )
         target_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids
+            output.hidden_states,
+            self.target_layer_ids,
+            offset=context_feature_offset(target),
         )
 
         # Decode stage
@@ -1067,7 +1123,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(
-                output.hidden_states, self.target_layer_ids
+                output.hidden_states,
+                self.target_layer_ids,
+                offset=context_feature_offset(target),
             )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
             if stop_token_ids is not None and any(

@@ -29,6 +29,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from .dflash import (
     DFlashDraftModel,
     apply_rotary_pos_emb,
+    context_feature_offset,
     extract_context_feature,
     project_draft_logits,
     sample,
@@ -530,7 +531,9 @@ class DFlashLinearDraftModel(DFlashDraftModel):
             temperature,
         )
         prefix_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids
+            output.hidden_states,
+            self.target_layer_ids,
+            offset=context_feature_offset(target),
         )
 
         acceptance_lengths = []
@@ -582,7 +585,9 @@ class DFlashLinearDraftModel(DFlashDraftModel):
                 [
                     prefix_hidden,
                     extract_context_feature(
-                        output.hidden_states, self.target_layer_ids
+                        output.hidden_states,
+                        self.target_layer_ids,
+                        offset=context_feature_offset(target),
                     )[:, : acceptance_length + 1, :],
                 ],
                 dim=1,

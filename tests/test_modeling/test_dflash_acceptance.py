@@ -104,3 +104,58 @@ class DFlashAcceptanceTest(unittest.TestCase):
         )
         expected_ids[:, 0] = sequence_ids[:, 6]
         torch.testing.assert_close(captured[0], embed(expected_ids))
+
+    def test_context_feature_offset_defaults_to_one(self):
+        from specforge.modeling.draft.dflash import context_feature_offset
+
+        class Cfg:
+            model_type = "qwen3_5"
+            architectures = ["Qwen3_5ForConditionalGeneration"]
+
+        self.assertEqual(context_feature_offset(Cfg()), 1)
+        self.assertEqual(
+            context_feature_offset(type("C", (), {"model_type": "qwen3"})()),
+            1,
+        )
+
+    def test_extract_context_feature_offset_selects_different_layers(self):
+        from specforge.modeling.draft.dflash import extract_context_feature
+
+        layers = [torch.full((1, 2, 4), float(i)) for i in range(5)]
+        off1 = extract_context_feature(layers, [1], offset=1)
+        off0 = extract_context_feature(layers, [1], offset=0)
+        self.assertTrue(torch.equal(off1, layers[2]))
+        self.assertTrue(torch.equal(off0, layers[1]))
+        with self.assertRaises(IndexError):
+            extract_context_feature(layers, [4], offset=1)
+
+    def test_acceptance_uses_injected_target_hidden(self):
+        import specforge.modeling.draft.dflash as dflash_mod
+
+        torch.manual_seed(6)
+        target = _tiny_target()
+        model = _tiny_stock()
+        model.eval()
+        sequence_ids = torch.randint(1, 256, (1, 14))
+        width = len(model.target_layer_ids) * model.config.hidden_size
+        injected = torch.randn(1, 14, width)
+        extracted = {"called": False}
+        orig_fn = dflash_mod.extract_context_feature
+
+        def boom(*args, **kwargs):
+            extracted["called"] = True
+            raise AssertionError("extract_context_feature should not run")
+
+        dflash_mod.extract_context_feature = boom
+        try:
+            lengths = model.acceptance_along_sequence(
+                target,
+                sequence_ids,
+                prompt_len=6,
+                temperature=0.0,
+                target_hidden=injected,
+            )
+        finally:
+            dflash_mod.extract_context_feature = orig_fn
+        self.assertTrue(lengths)
+        self.assertFalse(extracted["called"])

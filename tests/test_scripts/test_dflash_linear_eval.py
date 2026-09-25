@@ -282,6 +282,24 @@ class SglangMalHelpersTest(unittest.TestCase):
         self.assertTrue(args.enable_thinking)
         self.assertEqual(args.max_new_tokens, 4096)
         self.assertEqual(args.mt_bench_turns, "first")
+        self.assertEqual(args.feature_offset, "auto")
+        self.assertEqual(args.feature_source, "hf")
+        args_sg = _EVAL.build_parser().parse_args(
+            [
+                "mal",
+                "--target",
+                "t",
+                "--draft",
+                "d",
+                "--replay-json",
+                "r.json",
+                "--out",
+                "o.json",
+                "--feature-source",
+                "sglang",
+            ]
+        )
+        self.assertEqual(args_sg.feature_source, "sglang")
         args_off = _EVAL.build_parser().parse_args(
             [
                 "sglang-mal",
@@ -295,6 +313,92 @@ class SglangMalHelpersTest(unittest.TestCase):
             ]
         )
         self.assertFalse(args_off.enable_thinking)
+
+    def test_flatten_token_ids_reads_batch_encoding_keys(self):
+        from collections import UserDict
+
+        class Encoding(UserDict):
+            pass
+
+        self.assertEqual(
+            _EVAL.flatten_token_ids(Encoding({"input_ids": [7, 8, 9]})),
+            [7, 8, 9],
+        )
+        self.assertEqual(_EVAL.flatten_token_ids({"input_ids": [[1, 2, 3]]}), [1, 2, 3])
+        self.assertEqual(_EVAL.flatten_token_ids([4, 5]), [4, 5])
+
+    def test_normalize_aux_feature_keeps_seq_hidden(self):
+        if torch is None:
+            self.skipTest("torch is not installed")
+        feat = torch.arange(12, dtype=torch.float32).view(3, 4)
+        out = _EVAL.normalize_aux_feature(feat, 3)
+        self.assertEqual(tuple(out.shape), (3, 4))
+        self.assertTrue(torch.equal(out, feat.cpu()))
+        packed = feat.unsqueeze(0)
+        self.assertEqual(tuple(_EVAL.normalize_aux_feature(packed, 3).shape), (3, 4))
+        layered = torch.arange(24, dtype=torch.float32).view(3, 2, 4)
+        self.assertEqual(
+            tuple(_EVAL.normalize_aux_feature(layered, 3).shape), (3, 8)
+        )
+
+    def test_split_prompt_and_completion_from_full_ids(self):
+        prompt, completion = _EVAL.split_prompt_and_completion(
+            [1, 2, 3, 4, 5],
+            prompt_ids=[1, 2],
+            prompt_tokens=2,
+            completion_tokens=3,
+        )
+        self.assertEqual(prompt, [1, 2])
+        self.assertEqual(completion, [3, 4, 5])
+
+    def test_parse_sglang_generate_extracts_token_ids(self):
+        parsed = _EVAL.parse_sglang_generate(
+            {
+                "text": "ok",
+                "output_ids": [10, 11, 12, 13],
+                "meta_info": {
+                    "prompt_tokens": 2,
+                    "completion_tokens": 2,
+                    "spec_accept_length": 2.0,
+                    "finish_reason": "stop",
+                },
+            },
+            max_new_tokens=512,
+            prompt_ids=[10, 11],
+        )
+        self.assertEqual(parsed["prompt_ids"], [10, 11])
+        self.assertEqual(parsed["completion_ids"], [12, 13])
+
+    def test_load_replay_trajectories_requires_token_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sglang.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "raw": [
+                            {
+                                "question_id": "HumanEval/0",
+                                "category": "coding",
+                                "prompt_ids": [1, 2],
+                                "completion_ids": [3, 4, 5],
+                                "spec_accept_length": 3.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows = _EVAL.load_replay_trajectories(str(path))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["sequence_ids"], [1, 2, 3, 4, 5])
+            self.assertEqual(rows[0]["prompt_len"], 2)
+            missing = Path(tmp) / "bad.json"
+            missing.write_text(
+                json.dumps({"raw": [{"question_id": "x", "category": "coding"}]}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(SystemExit):
+                _EVAL.load_replay_trajectories(str(missing))
 
     def test_sampling_stops_at_eos_by_default(self):
         params = _EVAL.sglang_sampling_params(max_new_tokens=512, ignore_eos=False)

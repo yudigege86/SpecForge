@@ -24,6 +24,10 @@ MT_BENCH_TURNS="${MT_BENCH_TURNS:-first}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
 ENABLE_THINKING="${ENABLE_THINKING:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
+REPLAY_JSON="${REPLAY_JSON:-}"
+FEATURE_OFFSET="${FEATURE_OFFSET:-auto}"
+FEATURE_SOURCE="${FEATURE_SOURCE:-hf}"
+COMPARE_JSON="${COMPARE_JSON:-}"
 if [[ -z "${MAX_NEW_TOKENS}" ]]; then
   if [[ "${EVAL_DATASET}" == "qualitative" || "${EVAL_DATASET}" == "speedbench" || "${EVAL_DATASET}" == "speedbench-qualitative" ]]; then
     MAX_NEW_TOKENS=512
@@ -130,24 +134,34 @@ assert torch.cuda.is_available(), "MAL eval needs a GPU"
 PY
 fi
 
-if [[ "${FORCE_PREPARE}" == "1" || ! -s "${EVAL_JSONL}" ]]; then
-  echo "=== prepare ${EVAL_DATASET} ==="
-  python3 "${EVAL_PY}" prepare \
-    --dataset "${EVAL_DATASET}" \
-    --out "${EVAL_JSONL}" \
-    2>&1 | tee "${RUN_DIR}/prepare.log"
+if [[ -n "${REPLAY_JSON}" ]]; then
+  test -s "${REPLAY_JSON}"
+else
+  if [[ "${FORCE_PREPARE}" == "1" || ! -s "${EVAL_JSONL}" ]]; then
+    echo "=== prepare ${EVAL_DATASET} ==="
+    python3 "${EVAL_PY}" prepare \
+      --dataset "${EVAL_DATASET}" \
+      --out "${EVAL_JSONL}" \
+      2>&1 | tee "${RUN_DIR}/prepare.log"
+  fi
+  test -s "${EVAL_JSONL}"
 fi
-test -s "${EVAL_JSONL}"
 
 MAL_ARGS=(
   --target "${TARGET_MODEL}"
   --draft "${DRAFT_HF}"
-  --eval-jsonl "${EVAL_JSONL}"
   --out "${RUN_DIR}/mal.json"
   --summary "${RUN_DIR}/summary.md"
   --max-new-tokens "${MAX_NEW_TOKENS}"
   --mt-bench-turns "${MT_BENCH_TURNS}"
+  --feature-offset "${FEATURE_OFFSET}"
+  --feature-source "${FEATURE_SOURCE}"
 )
+if [[ -n "${REPLAY_JSON}" ]]; then
+  MAL_ARGS+=(--replay-json "${REPLAY_JSON}")
+else
+  MAL_ARGS+=(--eval-jsonl "${EVAL_JSONL}")
+fi
 if [[ "${ENABLE_THINKING}" == "0" || "${ENABLE_THINKING}" == "false" ]]; then
   MAL_ARGS+=(--disable-thinking)
 fi
@@ -159,7 +173,17 @@ if [[ -n "${EVAL_CATEGORIES}" ]]; then
   MAL_ARGS+=(--categories ${EVAL_CATEGORIES})
 fi
 
-echo "=== ${EVAL_DATASET} MAL ==="
+echo "=== ${EVAL_DATASET} MAL feature_offset=${FEATURE_OFFSET} feature_source=${FEATURE_SOURCE} replay=${REPLAY_JSON:-none} ==="
 python3 "${EVAL_PY}" mal "${MAL_ARGS[@]}" 2>&1 | tee "${RUN_DIR}/mal.log"
+if [[ -n "${COMPARE_JSON}" ]]; then
+  test -s "${COMPARE_JSON}"
+  echo "=== compare replay vs ${COMPARE_JSON} ==="
+  python3 "${EVAL_PY}" compare-mal \
+    --offline "${RUN_DIR}/mal.json" \
+    --sglang "${COMPARE_JSON}" \
+    --out "${RUN_DIR}/compare_replay.json" \
+    --summary "${RUN_DIR}/compare_replay.md" \
+    2>&1 | tee "${RUN_DIR}/compare_replay.log"
+fi
 echo "PASS: ${EVAL_DATASET} MAL"
 echo "run_dir=${RUN_DIR}"

@@ -19,6 +19,7 @@ EVAL_N="${EVAL_N:-}"
 EVAL_CATEGORIES="${EVAL_CATEGORIES:-}"
 MT_BENCH_TURNS="${MT_BENCH_TURNS:-first}"
 FORCE_PREPARE="${FORCE_PREPARE:-0}"
+REPLAY_OFFLINE="${REPLAY_OFFLINE:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 ENABLE_THINKING="${ENABLE_THINKING:-}"
 if [[ -z "${MAX_NEW_TOKENS}" ]]; then
@@ -189,5 +190,23 @@ fi
 echo "=== ${EVAL_DATASET} SGLang DFLASH MAL ==="
 python3 "${EVAL_PY}" sglang-mal "${MAL_ARGS[@]}" 2>&1 | tee "${RUN_DIR}/sglang_mal.log"
 stop_server
+if [[ "${REPLAY_OFFLINE}" == "1" || "${REPLAY_OFFLINE}" == "true" ]]; then
+  echo "=== ${EVAL_DATASET} offline replay of SGLang trajectories ==="
+  python3 "${EVAL_PY}" mal \
+    --target "${TARGET_MODEL}" \
+    --draft "${DRAFT_HF}" \
+    --replay-json "${RUN_DIR}/sglang_mal.json" \
+    --out "${RUN_DIR}/replay_mal.json" \
+    --summary "${RUN_DIR}/replay_summary.md" \
+    --max-new-tokens "${MAX_NEW_TOKENS}" \
+    --mt-bench-turns "${MT_BENCH_TURNS}" \
+    2>&1 | tee "${RUN_DIR}/replay_mal.log"
+  python3 "${EVAL_PY}" compare-mal \
+    --offline "${RUN_DIR}/replay_mal.json" \
+    --sglang "${RUN_DIR}/sglang_mal.json" \
+    --out "${RUN_DIR}/compare_replay.json" \
+    --summary "${RUN_DIR}/compare_replay.md" \
+    2>&1 | tee "${RUN_DIR}/compare_replay.log"
+fi
 echo "PASS: ${EVAL_DATASET} SGLang DFLASH MAL"
 echo "run_dir=${RUN_DIR}"

@@ -2,6 +2,7 @@ from .base import Eagle3DraftModel
 from .dflash import (
     DFlashDraftModel,
     build_target_layer_ids,
+    context_feature_offset,
     extract_context_feature,
     sample,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "PEagleDraftModel",
     "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
+    "context_feature_offset",
     "extract_context_feature",
     "sample",
     "DRAFT_REGISTRY",
