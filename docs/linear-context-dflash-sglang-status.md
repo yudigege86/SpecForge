@@ -76,6 +76,7 @@ SpecForge:
 | [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) | Overlay fork files + spec-capture patch onto `lmsysorg/sglang:v0.5.18-rocm700-mi35x` |
 | [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh) | Stages the Dockerfile and tags `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` |
 | `scripts/cluster/dflash-linear/` | Docker/sbatch launchers, overlay mounts |
+| `scripts/cluster/dflash-linear/archive/` | Pre-SGLang HuggingFace `spec_generate` serve/eval (do not use) |
 | `specforge/modeling/draft/dflash_linear.py` | Training / teacher-force draft |
 | `specforge/modeling/draft/linear_context.py` | `commit_block_masked` reference |
 | `tests/test_modeling/test_linear_context_serving_state.py` | Incremental commit == full scan; == `_teacher_force_block` |

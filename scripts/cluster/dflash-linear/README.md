@@ -1,8 +1,7 @@
 # Crusoe dflash_linear cluster tests
 
 Launchers for linear-context DFlash on the SPUR MI355X cluster. Data and
-results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`; this
-directory is the in-repo copy of the scripts.
+results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`.
 
 **Docs**
 
@@ -10,26 +9,33 @@ directory is the in-repo copy of the scripts.
 - [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
 - [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — `FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`; build with [build-sglang-0.5.18-image.sh](./build-sglang-0.5.18-image.sh)
 
-From a SpecForge checkout on the cluster:
+Live card MAL is SGLang `--speculative-algorithm DFLASH` plus
+`scripts/eval/dflash_linear_eval.py` (`sglang-mal`, then `mal --replay-json`
+with `--feature-source sglang`). Do not use HuggingFace `spec_generate`; those launchers are in
+`scripts/cluster/dflash-linear/archive/`.
+
+From a SpecForge checkout on the cluster (32 CPUs / 128G RAM for live
+DFLASH; burst QOS submit cap is 4):
 
 ```bash
-sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-mal.sbatch
+export TARGET_MODEL=Qwen/Qwen3.5-4B
+export DRAFT_HF=/shared_nfs/naqin/Linear-Context-DFlash/eval-1epoch/20260918T213552Z/draft_hf
+
+sbatch --account=amd-brain-models --qos=amd-burst-qos --partition=amd-spur \
+  --nodes=1 --gres=gpu:1 --cpus-per-task=32 --mem=128G --time=02:00:00 \
+  scripts/cluster/dflash-linear/cluster-dflash-linear-sglang-smoke.sbatch
 ```
 
-Offline MAL (no SGLang, teacher-forced accept length):
+Offline teacher-forced MAL on frozen live ids (same CLI for stock or linear):
 
 ```bash
-python scripts/eval/dflash_linear_serve.py mal \
+python scripts/eval/dflash_linear_eval.py mal \
   --target Qwen/Qwen3.5-4B \
   --draft /path/to/draft_hf \
-  --eval-jsonl /shared_nfs/naqin/primus-specforge-smoke/sharegpt_eval.holdout.jsonl \
-  --out mal.json --n 256 --max-new-tokens 64 --no-ignore-eos
+  --replay-json /path/to/sglang_mal.json \
+  --feature-source sglang \
+  --out replay_mal.json
 ```
-
-HTTP serve/eval (vanilla vs spec_generate) is the same module: `serve`, `eval`,
-`compare`. Live SGLang `--speculative-algorithm DFLASH` loads
-`DFlashLinearDraftModel` from the `yudigege86/sglang` `dflash-linear` fork
-(image `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x`).
 
 Capture replay (training forward on SGLang `.ckpt` features, no HF hidden
 states):
@@ -51,7 +57,7 @@ Feature A/B (same `input_ids`, capture vs HuggingFace `hidden_states`):
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-feature-ab.sbatch
 ```
 
-SPEED-Bench Qualitative MAL (any target + stock DFlash or dflash_linear; stop at EOS; per-category MAL):
+SPEED-Bench Qualitative MAL (any target + stock DFlash or dflash_linear; stop at EOS; per-category MAL). Qualitative uses protocol `concat_user` and is **not** a z-lab card number.
 
 ```bash
 python scripts/eval/dflash_linear_eval.py prepare-speedbench \
@@ -69,22 +75,16 @@ EVAL_DATASET=humaneval \
 TARGET_MODEL=Qwen/Qwen3.5-4B \
 DRAFT_HF=z-lab/Qwen3.5-4B-DFlash \
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-speedbench-mal.sbatch
-
-EVAL_DATASET=mt-bench \
-TARGET_MODEL=Qwen/Qwen3.5-4B \
-DRAFT_HF=z-lab/Qwen3.5-4B-DFlash \
-sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-speedbench-mal.sbatch
 ```
 
-Same split through stock SGLang `--speculative-algorithm DFLASH` (z-lab draft), then compare to the offline JSON:
+Same split through live SGLang DFLASH, then compare:
 
 ```bash
 python scripts/eval/dflash_linear_eval.py sglang-mal \
   --target Qwen/Qwen3.5-4B \
   --draft z-lab/Qwen3.5-4B-DFlash \
-  --eval-jsonl /shared_nfs/naqin/Linear-Context-DFlash/speedbench/qualitative.jsonl \
+  --eval-jsonl /shared_nfs/naqin/Linear-Context-DFlash/speedbench/humaneval.jsonl \
   --base http://127.0.0.1:30000 \
-  --compare-json /path/to/speedbench_mal.json \
   --out sglang_mal.json
 
 COMPARE_JSON=/path/to/speedbench_mal.json \
@@ -101,3 +101,7 @@ sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-rebaseline.sbatch
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-parity.sbatch
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-m1-gates.sbatch
 ```
+
+Training-era launchers (`cluster-dflash-linear-1epoch.sbatch`, naive-steps,
+layer-test, FLA scan, yaml configs) stay in this directory. They are not
+the live MAL path.

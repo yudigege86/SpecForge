@@ -103,12 +103,17 @@ live) because it was not the card setting.
 
 ### 4.2 Linear GDN (1-epoch export)
 
-No live SGLang path. Only HF-feature offline MAL: Qualitative 880 **1.51**.
-That number uses the scorer that undercounted stock by ~2×. It is **not** a
-real accept length and must not be compared to the card or to live stock.
+**Historical (HF hidden states, before live SGLang).** Qualitative 880
+**1.51**. That scorer undercounted stock by ~2×. ShareGPT holdout after the
+mask-leak fix: teacher-forced MAL **2.26** (training EAL ~2.10 at step 620).
+Neither is a card number.
 
-ShareGPT holdout after the mask-leak fix: teacher-forced MAL **2.26**
-(training EAL ~2.10 at step 620). Same caveat: HF features.
+**M1 live SGLang (0.5.18).** HE n=16 live MAL **2.459** vs SGLang-aux replay
+**2.448** (rel 0.42%) at batch 1/4 and overlap on/off. Mixed accept/reject,
+16/16 EOS. Details:
+[docs/linear-context-dflash-sglang-status.md](../../../docs/linear-context-dflash-sglang-status.md).
+This is served accept length for that checkpoint, not a z-lab card (stock
+on the same image is ~7.9).
 
 ### 4.3 What closed the stock gap
 
@@ -135,45 +140,44 @@ normalization, verifier accounting.
 | Absolute MAL for **stock** DFlash on Qwen3.5-4B | Yes: live `sglang-mal`. SGLang-aux replay is a ~3% offline cross-check on this target. |
 | Ranking two drafters on the same frozen ids and SGLang aux | Ranks **teacher-forced draft quality** on that trajectory. Does **not** guarantee live ranking until linear serving validates state lifecycle, kernel numerics, and block execution. |
 | Default `--feature-source hf` as a published MAL | No. ~2× undercount on this target. Cosine vs SGLang aux does not certify the scorer. |
-| Absolute MAL for **linear** | No live number. SGLang-aux teacher-force is the best proxy; it is not served accept length. |
+| Absolute MAL for **linear** | HE n=16 live vs SGLang-aux is reliable for that checkpoint (0.42%). HE 164 and MT-Bench (M2) are not run. Not a z-lab card. |
 | New target models | Not proven. Capture layer map, hybrid vs dense +1, ROCm Mamba radix / `extra_buffer`, and mem-fraction all broke on Qwen3.5 until patched. |
 | Latency, draft-state bytes, tokens/s vs \(L\) | Not measured. Teacher-force cannot produce them. |
 
 ## 6. Current issues
 
-**Linear cannot be served.** Stock SGLang `DFLASH` loads `DFlashDraftModel`
-and concat-KV. `DFlashLinearDraftModel` is rejected. SpecForge
+**HuggingFace `spec_generate` is not the serving path.** Stock SGLang
+`DFLASH` used to reject `DFlashLinearDraftModel`. SpecForge
 `dflash_linear_serve.py` (`spec_generate`) failed on Qwen3.5 hybrid
-`DynamicCache` (`has_previous_state`). The serving engine that already runs
-this target is SGLang, not HuggingFace.
+`DynamicCache` (`has_previous_state`). That stack is archived under
+`scripts/cluster/dflash-linear/archive/`. Live eval uses the
+`yudigege86/sglang` `dflash-linear` fork (see
+[linear-context-dflash-sglang-eval.md](../../../docs/linear-context-dflash-sglang-eval.md)).
 
-**Offline capture is version-fragile.** SpecForge’s `offline_capture` stack
-is written for SGLang 0.5.18. The cluster image is 0.5.14. Getting
-`--feature-source sglang` running required 0.5.14 fallbacks,
-`disable_radix_cache=True` (Mamba `extra_buffer` asserts CUDA/FLA on ROCm),
-and `mem_fraction_static=0.85`. Prefer rebuilding on 0.5.18 and dropping
-the shims.
+**Offline capture was version-fragile on 0.5.14.** SpecForge’s
+`offline_capture` stack targets SGLang 0.5.18. Getting `--feature-source
+sglang` running on 0.5.14 required fallbacks, `disable_radix_cache=True`,
+and `mem_fraction_static=0.85`. The current image is 0.5.18; do not bring
+those shims back.
 
 **HF and SGLang aux are not interchangeable** on Qwen3.5 even at offset 1.
 `target_layer_ids` is not a complete feature contract (see §8.1).
+Feature-contract-check vs the 40k training capture passed (mean cosine
+0.99983) on 0.5.18 live aux.
 
-**One-epoch linear has no calibrated MAL.** Qualitative 1.51 and ShareGPT
-2.26 are HF-feature scores. Re-score the export with SGLang-aux replay
-before comparing to stock.
+**Paper metrics beyond MAL are still blocked** on graphs / fused commit /
+an \(L\)-sweep (M3). Draft-cache bytes, draft/verify latency, and
+end-to-end throughput vs \(L\) are not M1 deliverables.
 
-**Paper metrics beyond MAL are blocked** until linear runs in a real decode
-loop: draft-cache bytes, draft/verify latency, end-to-end throughput vs
-\(L\).
+**Benchmark artifacts are pinned in `run_record`** on current
+`dflash_linear_eval.py` dumps (JSONL SHA256, revisions, image digest,
+`/get_server_info`). Direct offline used to re-tokenize chat text; replay
+dumps remain the comparison standard.
 
-**Benchmark artifacts are under-specified.** Prepared JSONL, model
-revisions, and image digest are not pinned in the run record. Direct
-offline used to re-tokenize chat text; replay dumps are the comparison
-standard.
+## 7. Interim eval protocol (training checkpoints)
 
-## 7. Interim eval protocol (until linear is in SGLang)
-
-Do not wait on the SGLang port to train. After **M-1** artifacts exist,
-for each target that has been calibrated like Qwen3.5:
+M1 live serving exists. Do not wait on M2/M3 to train. After **M-1**
+artifacts exist, for each target that has been calibrated like Qwen3.5:
 
 1. If a stock DFlash exists, run live `sglang-mal` on HumanEval and MT-Bench
    turn 1. Dump `prompt_ids` / `completion_ids`.
@@ -346,9 +350,11 @@ Measured (1-epoch export, HE n=16, four scheduler settings): (1)–(2) hold
 at 0.42% rel MAL; (3) shadow passed; stock divergence 10/16 with no
 prefix mismatch in the first 8 tokens.
 
-Until (1)–(2), published MAL for linear remains teacher-forced and labeled
-as such. Sequencing stays: **calibrated replay now, live MAL parity before
-latency work, then the \(L\)-sweep.**
+M1 is done. Card-style published MAL still needs M2 (HE 164 + MT-Bench
+turn 1) and a trained-enough draft. Training checkpoints can keep using
+frozen ids + SGLang-aux, labeled teacher-forced. Sequencing stays:
+**calibrated replay for training, live MAL on exports, latency work after
+graphs.**
 
 ## 9. Pointers
 
@@ -357,6 +363,7 @@ latency work, then the \(L\)-sweep.**
 | SGLang eval runbook | `docs/linear-context-dflash-sglang-eval.md` |
 | Status and future work | `docs/linear-context-dflash-sglang-status.md` |
 | Runtime Dockerfile | `scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18` |
+| Archived HF serve eval | `scripts/cluster/dflash-linear/archive/` |
 | Eval CLI | `SpecForge/scripts/eval/dflash_linear_eval.py` |
 | Cluster MAL / SGLang | `SpecForge/scripts/cluster/dflash-linear/` |
 | SGLang fork | `yudigege86/sglang` branch `dflash-linear` |

@@ -15,6 +15,8 @@ SPEED-Bench Qualitative `concat_user` as a z-lab card number.
 Companion note: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md).
 Cluster launchers: `scripts/cluster/dflash-linear/`.
 Image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
+Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
+[scripts/cluster/dflash-linear/archive/](../scripts/cluster/dflash-linear/archive/).
 
 ## What you need
 
