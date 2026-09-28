@@ -242,6 +242,71 @@ def _validate_anchor_positions(
         )
 
 
+def apply_identity_mask(
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    commit_lens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero ``beta`` and ``log_decay`` at steps ``j >= commit_lens``.
+
+    With ``beta=0`` and ``log_decay=0`` (so ``α=1``), ``gated_delta_step``
+    is the identity: ``S_t = S_{t-1}``. Serving uses this to run a
+    fixed-shape B-token recurrence without host-side slicing or rollback.
+    """
+
+    if beta.ndim != 3:
+        raise ValueError(f"beta must be [B, T, H], got {tuple(beta.shape)}")
+    seq_len = beta.shape[1]
+    if commit_lens.ndim != 1 or int(commit_lens.shape[0]) != int(beta.shape[0]):
+        raise ValueError(
+            "commit_lens must be [B] matching beta's batch, "
+            f"got {tuple(commit_lens.shape)} vs batch={beta.shape[0]}"
+        )
+    steps = torch.arange(seq_len, device=beta.device).view(1, seq_len)
+    valid = steps < commit_lens.to(device=beta.device, dtype=steps.dtype).view(-1, 1)
+    beta = beta * valid[:, :, None].to(dtype=beta.dtype)
+    mask = valid
+    while mask.ndim < log_decay.ndim:
+        mask = mask.unsqueeze(-1)
+    log_decay = log_decay * mask.to(dtype=log_decay.dtype)
+    return log_decay, beta
+
+
+def commit_block_masked(
+    state: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    log_decay: torch.Tensor,
+    beta: torch.Tensor,
+    commit_lens: torch.Tensor,
+    *,
+    normalize_qk: bool = False,
+) -> torch.Tensor:
+    """Apply a T-token GDN/KDA update; steps at ``j >= commit_lens`` are identity.
+
+    Args:
+        state: ``[B, H, K, V]`` recurrent matrix before the block.
+        key / value: ``[B, T, H, D]``.
+        log_decay: GDN ``[B, T, H]`` or KDA ``[B, T, H, K]``.
+        beta: ``[B, T, H]``.
+        commit_lens: ``[B]`` number of tokens to actually write.
+
+    Returns:
+        Updated state ``[B, H, K, V]``.
+    """
+
+    log_decay, beta = apply_identity_mask(log_decay, beta, commit_lens)
+    return gated_delta_scan(
+        key,
+        value,
+        log_decay,
+        beta,
+        initial_state=state,
+        return_all_states=False,
+        normalize_qk=normalize_qk,
+    )
+
+
 def gather_prefix_states(
     states_after: torch.Tensor,
     anchor_positions: torch.Tensor,
@@ -742,6 +807,8 @@ __all__ = [
     "GDN_DT_MIN",
     "LinearContextScan",
     "SCAN_CHUNK_SIZE",
+    "apply_identity_mask",
+    "commit_block_masked",
     "fla_available",
     "gated_delta_scan",
     "gated_delta_step",

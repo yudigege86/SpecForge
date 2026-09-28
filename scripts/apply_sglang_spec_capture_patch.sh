@@ -64,6 +64,12 @@ case "$TARGET" in
         ;;
 esac
 PATCH="${SPECFORGE_SPEC_CAPTURE_PATCH:-$HERE/patches/sglang/$PATCH_TARGET/spec-capture.patch}"
+# Windows-synced checkouts store the patch with CRLF; git apply then fails every hunk.
+if grep -q $'\r' "$PATCH" 2>/dev/null; then
+    PATCH_LF="$(mktemp)"
+    tr -d '\r' < "$PATCH" > "$PATCH_LF"
+    PATCH="$PATCH_LF"
+fi
 
 SGL_PARENT="${SPECFORGE_SGLANG_ROOT:-$(python -c 'import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))')}"
 SGL_VERSION="${SPECFORGE_SGLANG_VERSION:-$(python -c 'import sglang; print(sglang.__version__)')}"

@@ -7,6 +7,8 @@ cd /workspace/SpecForge
 echo "=== pip install -e . --no-deps ==="
 pip install -e . --no-deps
 pip install datasets pandas tiktoken requests
+bash /workspace/SpecForge/scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 || \
+  echo "WARN: spec-capture patch not applied"
 
 echo "=== CPU SGLang MAL helper tests ==="
 python3 -m unittest tests.test_scripts.test_dflash_linear_eval -v
@@ -80,20 +82,18 @@ draft = Path("${DRAFT_HF}")
 cfg_path = draft / "config.json"
 if cfg_path.is_file():
     cfg = json.loads(cfg_path.read_text())
-    arch = (cfg.get("architectures") or ["unknown"])[0]
     print("architectures", cfg.get("architectures"))
-    if arch == "DFlashLinearDraftModel":
-        raise SystemExit(
-            "stock SGLang DFLASH cannot load DFlashLinearDraftModel; "
-            "use the offline mal CLI for linear drafts"
-        )
 else:
     print("draft_hf_id", "${DRAFT_HF}")
 PY
 
 python3 - <<'PY'
+import os
 import sglang
 print("sglang", getattr(sglang, "__version__", "?"))
+print("sglang_file", getattr(sglang, "__file__", "?"))
+print("SGLANG_GIT_SHA", os.environ.get("SGLANG_GIT_SHA", ""))
+print("IMAGE_DIGEST", os.environ.get("IMAGE_DIGEST", os.environ.get("RUNTIME_IMAGE_ID", "")))
 PY
 
 HELP="$(python3 -m sglang.launch_server --help 2>&1 || true)"
@@ -109,7 +109,7 @@ LAUNCH=(
   --host 127.0.0.1
   --port "${SERVER_PORT}"
   --disable-cuda-graph
-  --max-running-requests 1
+  --max-running-requests "${MAX_RUNNING_REQUESTS:-1}"
 )
 if grep -q -- "--speculative-num-draft-tokens" <<<"${HELP}"; then
   LAUNCH+=(--speculative-num-draft-tokens "${BLOCK_SIZE}")
@@ -121,6 +121,11 @@ if grep -q -- "--mamba-scheduler-strategy" <<<"${HELP}"; then
 fi
 if grep -q -- "--disable-radix-cache" <<<"${HELP}"; then
   LAUNCH+=(--disable-radix-cache)
+fi
+if [[ "${OVERLAP_SCHEDULE:-1}" == "0" || "${OVERLAP_SCHEDULE:-1}" == "false" ]]; then
+  if grep -q -- "--disable-overlap-schedule" <<<"${HELP}"; then
+    LAUNCH+=(--disable-overlap-schedule)
+  fi
 fi
 
 stop_server() {
@@ -196,6 +201,7 @@ if [[ "${REPLAY_OFFLINE}" == "1" || "${REPLAY_OFFLINE}" == "true" ]]; then
     --target "${TARGET_MODEL}" \
     --draft "${DRAFT_HF}" \
     --replay-json "${RUN_DIR}/sglang_mal.json" \
+    --feature-source sglang \
     --out "${RUN_DIR}/replay_mal.json" \
     --summary "${RUN_DIR}/replay_summary.md" \
     --max-new-tokens "${MAX_NEW_TOKENS}" \

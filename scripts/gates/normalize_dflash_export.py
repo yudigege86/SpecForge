@@ -155,6 +155,25 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
         handle.write("\n")
+    if _DFLASH_LINEAR_ARCHITECTURE in (config.get("architectures") or []):
+        contract_path = path.parent / "feature_contract.json"
+        contract = {
+            "capture_implementation": "sglang_dflash_aux",
+            "target_layer_ids": list(method_config.get("target_layer_ids") or []),
+            "layer_index_convention": (
+                "embeddings_at_0; dense_qwen3_sglang_marks_k_plus_1; "
+                "qwen3.5_hybrid_marks_k; specforge_offset_default_1"
+            ),
+            "location": "post_layer",
+            "norm": "fc_then_rmsnorm",
+            "dtype": config.get("dtype") or config.get("torch_dtype"),
+            "fusion": "concat_then_fc_rmsnorm",
+            "architectures": list(config.get("architectures") or []),
+            "block_size": config.get("block_size"),
+            "linear_context": method_config.get("linear_context"),
+            "mask_token_id": method_config.get("mask_token_id"),
+        }
+        contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
     return config
 
 

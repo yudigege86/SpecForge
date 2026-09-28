@@ -8,14 +8,12 @@ Treat **SGLang DFLASH aux as a versioned model interface**, not an
 implementation detail. A drafter trained or scored on one engine's hidden
 states is silently tied to that engine's capture ABI.
 
-Setup: SpecForge fork `yudigege86/SpecForge` branch `dflash-linear`, cluster
-image `naqin/primus-specforge:v0.5.14-rocm700-mi35x` (SGLang 0.5.14, MI355X /
-gfx950), target `Qwen/Qwen3.5-4B`, stock draft `z-lab/Qwen3.5-4B-DFlash`,
-one-epoch linear export under
-`/shared_nfs/naqin/Linear-Context-DFlash/eval-1epoch/.../draft_hf`.
-**Target runtime is SGLang 0.5.18** (what SpecForge pins). Rebuild the cluster
-image rather than keep 0.5.14 compatibility patches, unless a 0.5.18 ROCm
-MI355X image fails validation.
+Setup: SpecForge fork `yudigege86/SpecForge` branch `dflash-linear`, SGLang
+fork `yudigege86/sglang` branch `dflash-linear` off v0.5.18 (`183d5173`),
+cluster image `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x`
+(SGLang 0.5.18, MI355X / gfx950), target `Qwen/Qwen3.5-4B`, stock draft
+`z-lab/Qwen3.5-4B-DFlash`, one-epoch linear export under
+`/shared_nfs/naqin/Linear-Context-DFlash/eval-1epoch/20260918T213552Z/draft_hf`.
 
 ## 1. Goal
 
@@ -198,6 +196,9 @@ Follow the DFlash2 pattern: **same serving algorithm `DFLASH`**, different
 draft architecture. Reuse target capture, verify, and
 `set_dflash_layers_to_capture`. Branch only the draft worker.
 
+**Home:** `yudigege86/sglang` branch `dflash-linear` (v0.5.18 peel
+`183d5173`). SpecForge keeps eval, CPU state tests, and cluster launchers.
+
 ### 8.1 Feature contract (versioned aux ABI)
 
 Persist this with every draft checkpoint and every MAL report. Layer ids
@@ -212,6 +213,16 @@ alone are not enough:
 Training, teacher-force, and serving must name the same contract. A silent
 engine change is how HF vs SGLang halved MAL.
 
+`scripts/eval/dflash_linear_eval.py` now writes a `run_record` (JSONL SHA256,
+HF revisions, `sglang.__version__`, fork SHA, `IMAGE_DIGEST`,
+`/get_server_info`) and `feature_contract.json`. `compare-mal` requires
+complete `question_id` overlap unless `--allow-partial`, and computes deltas
+only on `token_identical` rows. `feature-contract-check` recaptures N=16
+samples from the 40k training capture through live 0.5.18 DFLASH aux and
+gates mean cosine at ≥ 0.99. Failure of that gate does not block M1 (live
+serving and aux replay share the same engine); it blocks publishing
+**absolute** linear MAL against the 0.5.14 training capture.
+
 ### 8.2 Design and state lifecycle
 
 Stock DFLASH today:
@@ -222,99 +233,99 @@ Stock DFLASH today:
 3. Dense (or sliding) attention over context KV plus the B-token block.
 4. Verify accepted prefix; append those tokens’ features to draft KV.
 
-Linear should keep (1) and the **accepted-token** update rule, and replace
-(2)–(3) with GDN/KDA prefix state plus dense B-token attention.
-Block-only RoPE / `position_ids` of length \(B\), not
-`arange(start+block_size)`.
+Linear keeps (1) and the **accepted-token** update rule, and replaces
+(2)–(3) with GDN prefix state plus dense B-token SDPA.
+
+**Positions.** Training and serving both use absolute RoPE
+`prefix_len + [0..B-1]` over the block. Do not re-base to `0..B-1`: equal
+in exact math, not in BF16.
+
+**State dtype.** Training keeps state BF16 between 64-token FLA windows.
+Serving keeps per-request state in FP32. Parity uses a tolerance (M4 spirit),
+not bit-identity.
+
+**Config.** Keep `model_type: qwen3` so `hybrid_gdn_config` does not treat
+the draft as Mamba. `linear_context.backend` is a training kernel choice;
+serving ignores it.
+
+**State size (this config).** D=5, H=8, K=V=64 → 163,840 elements / request
+(640 KiB FP32). Stock draft KV is 20,480 B/token BF16, so memory breaks even
+at about 16 BF16 or 32 FP32 tokens of context.
 
 **Invariant:** persistent state *before* a draft round contains target
-features strictly **before** the current anchor. Verification appends the
-old anchor plus accepted draft tokens. The newly sampled correction token
-remains the next explicit anchor and is **not** folded into persistent
-state until the following verify.
+features of `[0, prefix_len)`. Verification appends bonus + accepted tokens.
+The correction token becomes the next bonus and is **not** folded into the
+state yet.
 
-The port must handle, explicitly:
+SGLang v0.5.18 integration:
 
-- state allocation per request and per draft layer;
-- prompt prefill scan into GDN/KDA;
-- tentative block state (must not commit on reject);
-- commit at the accepted-prefix index;
-- rejection rollback;
-- batch compaction / reordering;
-- preemption and request migration;
-- prefix-cache cloning, or an explicit “incompatible with radix prefix
-  cache” flag;
-- CUDA-graph shape constraints (fixed block size \(B\), fixed state
-  tensors).
+- `spec_info.create_worker` returns `DFlashLinearWorkerV2` when
+  `architectures[0] == "DFlashLinearDraftModel"`.
+- Draft class: `python/sglang/srt/models/dflash_linear.py`
+  (`EntryClass = [DFlashLinearDraftModel]`), weight names 1:1 with SpecForge.
+- Prefill commit: varlen FLA `chunk_gated_delta_rule` (naive scan fallback).
+- Verify commit: masked B-step recurrence (`beta=0` and `log_decay=0` ⇒
+  identity). Eager torch loop for M1.
+- State rows are `req_pool_idx`-indexed and survive filter/merge.
+- M1 refuses draft-window, `tp_size > 1`, and radix cache.
+- Debug: `SGLANG_DFLASH_LINEAR_SHADOW_CHECK=1` recomputes a full-prefix scan
+  after every commit.
 
 Teacher-force never exercises rollback, compaction, preemption, or cache
 clone. Live ranking can invert vs frozen-id ranking until those paths are
-correct.
-
-Do not invent a second speculative algorithm name unless SGLang’s loader
-cannot dispatch on `architectures`.
+correct. The shadow check is the extra net.
 
 ### 8.3 Version pin
 
-**Prefer SGLang 0.5.18.** SpecForge is written for it. Rebuild
-`naqin/primus-specforge` on `lmsysorg/sglang:v0.5.18-rocm700-mi35x` (or the
-validated gfx950 equivalent), drop the 0.5.14 shims, and pin the image
-digest in M-1. Keep 0.5.14 only until that image is proven on this
-cluster. Do not implement the draft worker against a third version.
+**SGLang 0.5.18.** Image
+`naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` overlays the
+fork onto `lmsysorg/sglang:v0.5.18-rocm700-mi35x` and applies
+`patches/sglang/v0.5.18/spec-capture.patch`. Pin `IMAGE_DIGEST` in M-1
+`run_record`. Do not implement the draft worker against a third version.
 
 ### 8.4 Milestones
 
-**M-1 — benchmark contract (before any claimed number, including M0).**
+**M-1 — benchmark contract (landed in SpecForge).** Dataset prepare commits
+are pinned. Every `mal` / `sglang-mal` report embeds `run_record`.
+`compare-mal` is strict. `feature-contract-check` exists.
 
-- Pin dataset revisions and the remote SPEED-Bench / HumanEval / MT-Bench
-  prepare-script commits (do not float `prepare.py` from `HEAD`).
-- Save SHA256 of every prepared JSONL used in a report.
-- Save target, draft, and tokenizer revisions plus serving/capture image
-  digest.
-- Store prompt and completion token ids with every live or replay run.
-- `compare-mal` requires complete prompt / `question_id` overlap.
-- Require token-identical greedy trajectories before interpreting
-  per-question MAL deltas.
-- Record the §8.1 feature contract next to the checkpoint.
+**M0 — load and refuse-nothing (landed in the SGLang fork).** Loader accepts
+`DFlashLinearDraftModel`. Smoke: server starts, `/get_server_info` reports
+`DFLASH`, one `/generate` returns `spec_verify_ct`.
+`cluster-dflash-linear-sglang-smoke.sbatch`.
 
-**M0 — load and refuse-nothing.** SGLang draft loader accepts
-`DFlashLinearDraftModel` / `linear_context` in `dflash_config` without
-rewriting the class to `DFlashDraftModel`. Smoke: server starts, `/get_server_info`
-still reports `DFLASH`.
+**M1 — greedy MAL parity (landed).** Serve the 1-epoch linear greedy.
+`cluster-dflash-linear-m1-gates.sbatch` ran HE n=16 at batch 1 and 4,
+overlap on and off, with shadow check. Job 175655
+(`mal-eval/m1-gates/20260926T034914Z`), fork SHA `2a73ad467`. All four
+configs: live MAL 2.459 vs SGLang-aux replay 2.448 (rel 0.42%), mixed
+accept/reject (MAL ~2.5 on block 16), 16/16 EOS, shadow check held.
+Stock-vs-linear `completion_ids`: 6 identical, 10 diverge; first
+difference is never in the first 8 tokens (range 90–459).
 
-**M1 — greedy MAL parity (correctness), including state lifecycle.** Serve
-the 1-epoch linear (or a tiny overfit) greedy. Run `sglang-mal` HE n=16.
-Compare to the same weights scored with `--feature-source sglang`
-teacher-force **and** exercise reject/commit (not only all-accept
-smokes). If live and teacher-force disagree, serving kernels or state
-lifecycle are wrong — fix before any latency work.
+**M2 — stock vs linear on the same live protocol (outlined).** HumanEval 164
+plus MT-Bench turn 1 (80), thinking on, 4096, block 16. Same target, same
+prompts, M-1 artifacts. First publishable **relative live** MAL.
 
-**M2 — stock vs linear on the same live protocol.** HumanEval + MT-Bench
-turn 1, thinking on, 4096, block 16. Stock stays the current DFLASH worker;
-linear uses the new branch. Same target, same prompts, M-1 artifacts.
-This is the first publishable **relative live** MAL. Frozen-id ranking is
-not a substitute.
+**M3 and later (outlined).** CUDA-graph the draft forward; fused verify-commit
+kernel; shrink unused draft KV pool / `_resolve_dflash_draft_cell_size`;
+TP-shard state heads; KDA; radix-cache via Mamba-style copy-on-write;
+latency-vs-L sweep. `max_length: 2048` makes long-L eval out of distribution
+until long-context training data exists.
 
-**M3 — long-context efficiency.** Sweep context length \(L\): accept
-length, draft-state bytes, draft time, verify time, end-to-end tokens/s.
-Confirm state size is \(O(1)\) in \(L\) and that rejected tokens do not
-commit GDN/KDA updates.
-
-**M4 — kernels on gfx950.** Training uses FLA `[rocm]` inside SpecForge.
-Serving must match that math within an explicit BF16 tolerance, and
-**acceptance-level parity** on a short HE smoke (naive vs FLA). Do not
-require bit-identical tensors.
+**M4 — kernels on gfx950.** Serving must match training FLA math within an
+explicit BF16 tolerance, plus acceptance-level parity on a short HE smoke.
 
 **M5 — new targets.** For each target: n=16 live stock vs SGLang-aux vs
-live linear, under that target’s recorded feature contract. Do not assume
-Qwen3.5’s layer map.
+live linear, under that target’s recorded feature contract.
 
 ### 8.5 What not to do
 
 - Do not extend HuggingFace `spec_generate` as the long-term eval server
   for hybrid Mamba+attention targets.
 - Do not change stock DFlash except where the draft worker must dispatch
-  (shared capture / verify).
+  (shared capture / verify). Commit hooks in `DFlashWorkerV2` must stay
+  byte-for-byte the original appends.
 - Do not treat fused-KV vs GDN as a training-feature change; capture stays
   DFLASH aux under the same contract.
 - Do not block the next training runs on M0–M2. Keep using frozen ids +
@@ -323,13 +334,17 @@ Qwen3.5’s layer map.
 
 ### 8.6 Success criteria
 
-Linear-in-SGLang is done when:
+Linear-in-SGLang M1 is done when:
 
 1. `sglang-mal` runs for `DFlashLinearDraftModel` with the same CLI as stock;
-2. greedy HE n=16 live MAL is within a few percent of SGLang-aux teacher-force
-   for that checkpoint, including mixed accept/reject;
-3. a latency-vs-\(L\) sweep exists for stock concat-KV vs linear GDN on one
-   target.
+2. greedy HE n=16 live MAL is within ~3% of SGLang-aux teacher-force
+   for that checkpoint, including mixed accept/reject, at batch 1 and 4;
+3. shadow check passes; stock-vs-linear greedy `completion_ids` divergence
+   is reported (should be near-zero aside from numeric ties).
+
+Measured (1-epoch export, HE n=16, four scheduler settings): (1)–(2) hold
+at 0.42% rel MAL; (3) shadow passed; stock divergence 10/16 with no
+prefix mismatch in the first 8 tokens.
 
 Until (1)–(2), published MAL for linear remains teacher-forced and labeled
 as such. Sequencing stays: **calibrated replay now, live MAL parity before
@@ -341,8 +356,11 @@ latency work, then the \(L\)-sweep.**
 |---|---|
 | Eval CLI | `SpecForge/scripts/eval/dflash_linear_eval.py` |
 | Cluster MAL / SGLang | `SpecForge/scripts/cluster/dflash-linear/` |
+| SGLang fork | `yudigege86/sglang` branch `dflash-linear` |
+| Linear draft / worker | `sglang/python/sglang/srt/models/dflash_linear.py`, `.../speculative/dflash_linear_worker_v2.py` |
 | Stock teacher-force / aux inject | `specforge/modeling/draft/dflash.py` (`acceptance_along_sequence`) |
 | Linear block hook | `specforge/modeling/draft/dflash_linear.py` |
+| Serving-state tests | `SpecForge/tests/test_modeling/test_linear_context_serving_state.py` |
 | HE live dump | `/shared_nfs/naqin/Linear-Context-DFlash/mal-eval/humaneval-sglang/20260924T175823Z/sglang_mal.json` |
 | HE SGLang-aux result | `.../mal-eval/humaneval-sglang-aux/20260924T213555Z/` |
 | MT SGLang-aux result | `.../mal-eval/mt-bench-sglang-aux/20260924T213556Z/` |

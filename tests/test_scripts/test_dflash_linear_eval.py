@@ -516,6 +516,119 @@ class SglangMalHelpersTest(unittest.TestCase):
         self.assertAlmostEqual(compared["per_category"]["coding"]["delta_mean"], 0.2)
         self.assertAlmostEqual(compared["per_category"]["math"]["delta_mean"], -0.2)
 
+    def test_compare_mal_requires_complete_overlap(self):
+        offline = aggregate_mal_report(
+            [
+                {
+                    "question_id": "a",
+                    "category": "coding",
+                    "completion_tokens": 8,
+                    "spec_accept_length": 3.0,
+                }
+            ],
+            block_accepts=[3],
+        )
+        sglang = aggregate_mal_report(
+            [
+                {
+                    "question_id": "b",
+                    "category": "coding",
+                    "completion_tokens": 8,
+                    "spec_accept_length": 3.0,
+                }
+            ],
+            block_accepts=[3],
+        )
+        with self.assertRaises(SystemExit):
+            _EVAL.compare_mal_reports(offline, sglang)
+        partial = _EVAL.compare_mal_reports(offline, sglang, allow_partial=True)
+        self.assertEqual(partial["n_matched"], 0)
+
+    def test_compare_mal_deltas_use_token_identical_rows(self):
+        offline = aggregate_mal_report(
+            [
+                {
+                    "question_id": "same",
+                    "category": "coding",
+                    "completion_tokens": 4,
+                    "spec_accept_length": 2.0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [3, 4],
+                },
+                {
+                    "question_id": "diff",
+                    "category": "coding",
+                    "completion_tokens": 4,
+                    "spec_accept_length": 1.0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [9, 9],
+                },
+            ],
+            block_accepts=[2, 1],
+        )
+        sglang = aggregate_mal_report(
+            [
+                {
+                    "question_id": "same",
+                    "category": "coding",
+                    "completion_tokens": 4,
+                    "spec_accept_length": 2.5,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [3, 4],
+                },
+                {
+                    "question_id": "diff",
+                    "category": "coding",
+                    "completion_tokens": 4,
+                    "spec_accept_length": 8.0,
+                    "prompt_ids": [1, 2],
+                    "completion_ids": [7, 7],
+                },
+            ],
+            block_accepts=[2.5, 8],
+        )
+        compared = _EVAL.compare_mal_reports(offline, sglang)
+        self.assertEqual(compared["n_matched"], 2)
+        self.assertEqual(compared["n_token_identical"], 1)
+        self.assertEqual(compared["n_token_divergent"], 1)
+        self.assertAlmostEqual(compared["delta_mean"], 0.5)
+
+    def test_run_record_hashes_eval_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "eval.jsonl"
+            path.write_text('{"question_id":"x","turns":["hi"]}\n', encoding="utf-8")
+            digest = _EVAL.sha256_file(str(path))
+            self.assertEqual(len(digest), 64)
+            contract = _EVAL.feature_contract_from_draft(None)
+            self.assertEqual(contract["fusion"], "concat_then_fc_rmsnorm")
+            args = _EVAL.build_parser().parse_args(
+                ["mal", "--target", "t", "--draft", "d", "--out", "o.json"]
+            )
+            record = _EVAL.build_run_record(args, eval_jsonl=str(path))
+            self.assertEqual(record["eval_jsonl_sha256"], digest)
+            self.assertEqual(
+                record["prepare_pins"]["speedbench_prepare_commit"],
+                _EVAL.SPEEDBENCH_PREPARE_COMMIT,
+            )
+
+    def test_cli_includes_feature_contract_check(self):
+        args = _EVAL.build_parser().parse_args(
+            [
+                "feature-contract-check",
+                "--target",
+                "t",
+                "--draft",
+                "d",
+                "--hidden-states-path",
+                "h",
+                "--out",
+                "o.json",
+            ]
+        )
+        self.assertEqual(args.cmd, "feature-contract-check")
+        self.assertEqual(args.n, 16)
+        self.assertAlmostEqual(args.gate, 0.99)
+
 
 class DraftDispatchTest(unittest.TestCase):
     @unittest.skipIf(torch is None, "torch is not installed")

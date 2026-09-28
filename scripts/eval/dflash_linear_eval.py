@@ -9,12 +9,15 @@ at EOS; reports overall and per-category mean accept length.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from collections import defaultdict
 from collections.abc import Mapping
@@ -23,15 +26,20 @@ from typing import Any, Iterable, Optional
 
 PLACEHOLDER = "FULL BENCHMARK DATA SHOULD BE FETCHED FROM THE SOURCE USING SPECDEC_BENCH"
 SPEEDBENCH_REPO = "nvidia/SPEED-Bench"
+# Pin remote prepare artifacts. Do not float on branch HEAD.
+SPEEDBENCH_PREPARE_COMMIT = "5ac8609a56ac941540b10c92e68d556e6343cd4c"
 PREPARE_SCRIPT_URL = (
     "https://raw.githubusercontent.com/NVIDIA-NeMo/Skills/"
-    "refs/heads/main/nemo_skills/dataset/speed-bench/prepare.py"
+    f"{SPEEDBENCH_PREPARE_COMMIT}/nemo_skills/dataset/speed-bench/prepare.py"
 )
 HUMANEVAL_REPO = "openai/openai_humaneval"
+HUMANEVAL_SOURCE_COMMIT = "6d43fb980f9fee3c892a914eda09951f772ad10d"
+MTBENCH_COMMIT = "b494d0c6b4e7935f1764f8439e75da3e66beccc7"
 MTBENCH_URL = (
-    "https://raw.githubusercontent.com/lm-sys/FastChat/main/"
-    "fastchat/llm_judge/data/mt_bench/question.jsonl"
+    "https://raw.githubusercontent.com/lm-sys/FastChat/"
+    f"{MTBENCH_COMMIT}/fastchat/llm_judge/data/mt_bench/question.jsonl"
 )
+FEATURE_CONTRACT_COSINE_GATE = 0.99
 REQUIRED_FIELDS = (
     "question_id",
     "category",
@@ -235,6 +243,218 @@ def flatten_token_ids(ids: Any) -> list[int]:
     if not isinstance(ids, list) or not ids or isinstance(ids[0], str):
         raise TypeError(f"apply_chat_template tokenize=True returned {type(ids)!r}")
     return [int(x) for x in ids]
+
+
+def sha256_file(path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    file_path = Path(path)
+    if not file_path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_sha_from_dir(path: Path) -> Optional[str]:
+    try:
+        sha = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return sha.decode("utf-8").strip() or None
+
+
+def huggingface_revision(path_or_id: Optional[str]) -> Optional[str]:
+    if not path_or_id:
+        return None
+    path = Path(path_or_id)
+    if path.exists():
+        parts = list(path.resolve().parts)
+        if "snapshots" in parts:
+            index = parts.index("snapshots")
+            if index + 1 < len(parts):
+                return parts[index + 1]
+        git_sha = _git_sha_from_dir(path)
+        if git_sha:
+            return git_sha
+        config_path = path / "config.json" if path.is_dir() else None
+        if config_path and config_path.is_file():
+            try:
+                cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                cfg = {}
+            for key in ("_commit_hash", "commit_hash", "revision"):
+                value = cfg.get(key)
+                if value:
+                    return str(value)
+        return None
+    try:
+        from huggingface_hub import model_info
+
+        info = model_info(path_or_id)
+        return getattr(info, "sha", None)
+    except Exception:
+        return None
+
+
+def sglang_runtime_info() -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "sglang_version": None,
+        "sglang_git_sha": os.environ.get("SGLANG_GIT_SHA") or None,
+        "image_digest": (
+            os.environ.get("IMAGE_DIGEST")
+            or os.environ.get("RUNTIME_IMAGE_ID")
+            or os.environ.get("IMAGE_ID")
+            or None
+        ),
+        "runtime_image": os.environ.get("RUNTIME_IMAGE") or None,
+    }
+    try:
+        import sglang
+
+        info["sglang_version"] = getattr(sglang, "__version__", None)
+        if not info["sglang_git_sha"]:
+            module_file = getattr(sglang, "__file__", None)
+            if module_file:
+                info["sglang_git_sha"] = _git_sha_from_dir(
+                    Path(module_file).resolve().parent.parent
+                )
+    except Exception:
+        pass
+    return info
+
+
+def fetch_server_info(base: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    url = base.rstrip("/") + "/get_server_info"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    if not isinstance(payload, dict):
+        return {"raw": payload}
+    return payload
+
+
+def draft_config_payload(draft_path: Optional[str]) -> dict[str, Any]:
+    if not draft_path:
+        return {}
+    config_path = Path(draft_path) / "config.json"
+    if not config_path.is_file():
+        return {"draft": draft_path}
+    try:
+        return json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"draft": draft_path}
+
+
+def feature_contract_from_draft(
+    draft_path: Optional[str] = None,
+    *,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    cfg = draft_config_payload(draft_path)
+    method = dict(cfg.get("dflash_config") or {})
+    contract: dict[str, Any] = {
+        "capture_implementation": "sglang_dflash_aux",
+        "capture_version": sglang_runtime_info(),
+        "target_layer_ids": list(method.get("target_layer_ids") or []),
+        "layer_index_convention": (
+            "embeddings_at_0; dense_qwen3_sglang_marks_k_plus_1; "
+            "qwen3.5_hybrid_marks_k; specforge_offset_default_1"
+        ),
+        "location": "post_layer",
+        "norm": "fc_then_rmsnorm",
+        "dtype": cfg.get("dtype") or cfg.get("torch_dtype"),
+        "fusion": "concat_then_fc_rmsnorm",
+        "architectures": list(cfg.get("architectures") or []),
+        "block_size": cfg.get("block_size"),
+        "linear_context": method.get("linear_context"),
+        "mask_token_id": method.get("mask_token_id"),
+    }
+    if extra:
+        contract.update(extra)
+    return contract
+
+
+def write_feature_contract(
+    draft_path: str,
+    contract: Optional[dict[str, Any]] = None,
+) -> Path:
+    dest = Path(draft_path) / "feature_contract.json"
+    payload = contract or feature_contract_from_draft(draft_path)
+    dest.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return dest
+
+
+def load_feature_contract(draft_path: Optional[str]) -> Optional[dict[str, Any]]:
+    if not draft_path:
+        return None
+    path = Path(draft_path) / "feature_contract.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def build_run_record(
+    args: argparse.Namespace,
+    *,
+    eval_jsonl: Optional[str] = None,
+    replay_json: Optional[str] = None,
+    server_info: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    jsonl = eval_jsonl or getattr(args, "eval_jsonl", None) or None
+    draft = getattr(args, "draft", None) or None
+    target = getattr(args, "target", None) or None
+    record = {
+        "eval_jsonl": jsonl,
+        "eval_jsonl_sha256": sha256_file(jsonl),
+        "replay_json": replay_json,
+        "target": target,
+        "target_revision": huggingface_revision(target),
+        "draft": draft,
+        "draft_revision": huggingface_revision(draft),
+        "tokenizer": target,
+        "tokenizer_revision": huggingface_revision(target),
+        "prepare_pins": {
+            "speedbench_prepare_commit": SPEEDBENCH_PREPARE_COMMIT,
+            "mtbench_commit": MTBENCH_COMMIT,
+            "humaneval_source_commit": HUMANEVAL_SOURCE_COMMIT,
+            "speedbench_repo": SPEEDBENCH_REPO,
+            "humaneval_repo": HUMANEVAL_REPO,
+        },
+        "server_info": server_info,
+        **sglang_runtime_info(),
+    }
+    contract = load_feature_contract(draft) or feature_contract_from_draft(draft)
+    record["feature_contract"] = contract
+    return record
+
+
+def _ids_equal(left: Any, right: Any) -> Optional[bool]:
+    left_ids = _as_int_list(left)
+    right_ids = _as_int_list(right)
+    if left_ids is None or right_ids is None:
+        return None
+    return left_ids == right_ids
+
+
+def token_identical_pair(left: dict[str, Any], right: dict[str, Any]) -> Optional[bool]:
+    prompt = _ids_equal(left.get("prompt_ids"), right.get("prompt_ids"))
+    completion = _ids_equal(left.get("completion_ids"), right.get("completion_ids"))
+    if prompt is None and completion is None:
+        sequence = _ids_equal(left.get("sequence_ids"), right.get("sequence_ids"))
+        return sequence
+    if prompt is None or completion is None:
+        return None
+    return bool(prompt and completion)
 
 
 def load_eval_rows(path: str) -> list[dict[str, Any]]:
@@ -567,6 +787,12 @@ def _emit_prepared(out: Path, rows: list[dict[str, Any]], *, dataset: str) -> in
                 "dataset": dataset,
                 "out": str(out),
                 "n": len(rows),
+                "sha256": sha256_file(str(out)),
+                "prepare_pins": {
+                    "speedbench_prepare_commit": SPEEDBENCH_PREPARE_COMMIT,
+                    "mtbench_commit": MTBENCH_COMMIT,
+                    "humaneval_source_commit": HUMANEVAL_SOURCE_COMMIT,
+                },
                 "categories": categories,
             },
             indent=2,
@@ -1014,6 +1240,9 @@ def cmd_mal(args: argparse.Namespace) -> int:
             "finished_on_eos": finished_on_eos,
             "hit_max_new_tokens": hit_max_new_tokens,
             "elapsed_s": time.perf_counter() - started,
+            "run_record": build_run_record(
+                args, eval_jsonl=args.eval_jsonl, replay_json=replay_json
+            ),
             **draft_meta,
         },
     )
@@ -1449,6 +1678,8 @@ def wait_sglang(base: str, *, timeout: float, require_dflash: bool = True) -> di
 def compare_mal_reports(
     offline: dict[str, Any],
     sglang: dict[str, Any],
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, Any]:
     offline_raw = {
         str(row.get("question_id")): row
@@ -1469,6 +1700,7 @@ def compare_mal_reports(
         right = row.get("spec_accept_length")
         if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
             continue
+        identical = token_identical_pair(other, row)
         matched.append(
             {
                 "question_id": qid,
@@ -1476,16 +1708,30 @@ def compare_mal_reports(
                 "offline": float(left),
                 "sglang": float(right),
                 "delta": float(right) - float(left),
+                "token_identical": identical,
             }
         )
+    if not allow_partial and (missing_offline or missing_sglang_ids):
+        raise SystemExit(
+            "compare-mal requires complete question_id overlap; "
+            f"missing_in_offline={missing_offline[:8]} "
+            f"missing_in_sglang={sorted(missing_sglang_ids)[:8]}. "
+            "Pass --allow-partial to override."
+        )
+    ids_present = any(item["token_identical"] is not None for item in matched)
+    delta_rows = [
+        item
+        for item in matched
+        if (not ids_present) or item["token_identical"] is True
+    ]
     by_category: dict[str, list[float]] = defaultdict(list)
-    for item in matched:
+    for item in delta_rows:
         by_category[str(item.get("category") or "unknown")].append(item["delta"])
 
     def _mean(values: list[float]) -> Optional[float]:
         return float(statistics.mean(values)) if values else None
 
-    deltas = [item["delta"] for item in matched]
+    deltas = [item["delta"] for item in delta_rows]
     per_category = {}
     for category in sorted(set(offline.get("per_category") or {}) | set(sglang.get("per_category") or {})):
         off = (offline.get("per_category") or {}).get(category) or {}
@@ -1496,10 +1742,16 @@ def compare_mal_reports(
             "sglang": sg.get("spec_accept_length_mean"),
             "delta_mean": _mean(by_category.get(category) or []),
         }
+    n_identical = sum(1 for item in matched if item["token_identical"] is True)
+    n_divergent = sum(1 for item in matched if item["token_identical"] is False)
     return {
         "n_offline": offline.get("n"),
         "n_sglang": sglang.get("n"),
         "n_matched": len(matched),
+        "n_delta": len(delta_rows),
+        "n_token_identical": n_identical,
+        "n_token_divergent": n_divergent,
+        "ids_present": ids_present,
         "offline_mean": offline.get("spec_accept_length_mean"),
         "sglang_mean": sglang.get("spec_accept_length_mean"),
         "abs_delta_mean": (
@@ -1551,6 +1803,10 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
         categories=args.categories,
     )
     wait_sglang(args.base, timeout=args.wait_timeout, require_dflash=True)
+    try:
+        server_info = fetch_server_info(args.base)
+    except Exception as exc:  # noqa: BLE001
+        server_info = {"error": str(exc)}
     print(
         f"SGLang MAL n={len(rows)} max_new_tokens={args.max_new_tokens} "
         f"enable_thinking={args.enable_thinking} mt_bench_turns={args.mt_bench_turns} "
@@ -1704,6 +1960,9 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
             "finished_on_eos": finished_on_eos,
             "hit_max_new_tokens": hit_max_new_tokens,
             "elapsed_s": time.perf_counter() - started,
+            "run_record": build_run_record(
+                args, eval_jsonl=args.eval_jsonl, server_info=server_info
+            ),
         },
     )
     out = Path(args.out)
@@ -1736,6 +1995,7 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
         compare = compare_mal_reports(
             json.loads(Path(args.compare_json).read_text(encoding="utf-8")),
             report,
+            allow_partial=bool(getattr(args, "allow_partial", False)),
         )
         compare_path = Path(args.compare_out) if args.compare_out else out.with_name(
             "compare_sglang.json"
@@ -1766,7 +2026,9 @@ def cmd_sglang_mal(args: argparse.Namespace) -> int:
 def cmd_compare_mal(args: argparse.Namespace) -> int:
     offline = json.loads(Path(args.offline).read_text(encoding="utf-8"))
     sglang = json.loads(Path(args.sglang).read_text(encoding="utf-8"))
-    report = compare_mal_reports(offline, sglang)
+    report = compare_mal_reports(
+        offline, sglang, allow_partial=bool(args.allow_partial)
+    )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -1779,15 +2041,114 @@ def cmd_compare_mal(args: argparse.Namespace) -> int:
             key: report[key]
             for key in (
                 "n_matched",
+                "n_delta",
+                "n_token_identical",
+                "n_token_divergent",
                 "offline_mean",
                 "sglang_mean",
                 "delta_mean",
                 "abs_delta_mean",
                 "per_category",
             )
+            if key in report
         },
         indent=2,
     ), flush=True)
+    return 0
+
+
+def _flatten_ckpt_ids(value) -> list[int]:
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+        value = list(value[0])
+    return [int(item) for item in value]
+
+
+def cmd_feature_contract_check(args: argparse.Namespace) -> int:
+    """Compare stored training-capture aux vs live SGLang DFLASH aux."""
+
+    import gzip
+    import io
+
+    import torch
+
+    from specforge.runtime.data_plane.offline_reader import list_feature_files
+
+    def load_ckpt(path: str):
+        if path.endswith(".gz"):
+            with gzip.open(path, "rb") as handle:
+                return torch.load(io.BytesIO(handle.read()), weights_only=False)
+        return torch.load(path, weights_only=False)
+
+    files = list_feature_files(args.hidden_states_path)
+    if not files:
+        raise SystemExit(f"no feature files under {args.hidden_states_path}")
+    files = files[: int(args.n)]
+    sequences: list[list[int]] = []
+    stored: list[Any] = []
+    used: list[str] = []
+    for path in files:
+        raw = load_ckpt(path)
+        if "input_ids" not in raw or "hidden_states" not in raw:
+            continue
+        ids = _flatten_ckpt_ids(raw["input_ids"])
+        hidden = raw["hidden_states"]
+        if hasattr(hidden, "detach"):
+            hidden = hidden.detach()
+        if getattr(hidden, "ndim", 0) == 3:
+            hidden = hidden[0]
+        sequences.append(ids)
+        stored.append(hidden)
+        used.append(path)
+        if len(sequences) >= int(args.n):
+            break
+    if not sequences:
+        raise SystemExit("feature-contract-check found no (input_ids, hidden_states) pairs")
+
+    layer_ids = draft_target_layer_ids(args.draft)
+    captured = capture_sglang_aux_features(args.target, sequences, layer_ids)
+    rows = []
+    cosines = []
+    for path, sg_feat, stored_feat, ids in zip(used, captured, stored, sequences):
+        stored_t = stored_feat if hasattr(stored_feat, "shape") else torch.tensor(stored_feat)
+        cosine = token_cosine_mean(sg_feat, stored_t)
+        cosines.append(cosine)
+        rows.append(
+            {
+                "path": path,
+                "seq_len": len(ids),
+                "stored_shape": list(stored_t.shape),
+                "live_shape": list(sg_feat.shape),
+                "cosine": cosine,
+            }
+        )
+    mean_cosine = float(statistics.mean(cosines)) if cosines else None
+    gate = float(getattr(args, "gate", FEATURE_CONTRACT_COSINE_GATE))
+    report = {
+        "n": len(rows),
+        "mean_cosine": mean_cosine,
+        "min_cosine": float(min(cosines)) if cosines else None,
+        "gate": gate,
+        "passed": bool(mean_cosine is not None and mean_cosine >= gate),
+        "target": args.target,
+        "draft": args.draft,
+        "hidden_states_path": args.hidden_states_path,
+        "layer_ids": layer_ids,
+        "run_record": build_run_record(args),
+        "feature_contract": feature_contract_from_draft(args.draft),
+        "rows": rows,
+    }
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(json.dumps({k: report[k] for k in ("n", "mean_cosine", "min_cosine", "gate", "passed")}, indent=2), flush=True)
+    print(f"wrote {out}", flush=True)
+    if not report["passed"]:
+        raise SystemExit(
+            f"feature-contract-check failed: mean_cosine={mean_cosine} < gate={gate}. "
+            "Retrain on 0.5.18 capture before publishing absolute linear MAL."
+        )
     return 0
 
 
@@ -1910,6 +2271,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_generation_flags(sglang, sglang=True)
     sglang.add_argument("--compare-json", default=None)
     sglang.add_argument("--compare-out", default=None)
+    sglang.add_argument("--allow-partial", action="store_true")
     sglang.set_defaults(func=cmd_sglang_mal)
 
     compare = sub.add_parser("compare-mal")
@@ -1917,7 +2279,17 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--sglang", required=True)
     compare.add_argument("--out", required=True)
     compare.add_argument("--summary", default=None)
+    compare.add_argument("--allow-partial", action="store_true")
     compare.set_defaults(func=cmd_compare_mal)
+
+    contract = sub.add_parser("feature-contract-check")
+    contract.add_argument("--target", required=True)
+    contract.add_argument("--draft", required=True)
+    contract.add_argument("--hidden-states-path", required=True)
+    contract.add_argument("--out", required=True)
+    contract.add_argument("--n", type=int, default=16)
+    contract.add_argument("--gate", type=float, default=FEATURE_CONTRACT_COSINE_GATE)
+    contract.set_defaults(func=cmd_feature_contract_check)
     return parser
 
 

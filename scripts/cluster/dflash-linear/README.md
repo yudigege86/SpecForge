@@ -21,8 +21,9 @@ python scripts/eval/dflash_linear_serve.py mal \
 ```
 
 HTTP serve/eval (vanilla vs spec_generate) is the same module: `serve`, `eval`,
-`compare`. Stock SGLang `--speculative-algorithm DFLASH` cannot load
-`DFlashLinearDraftModel`.
+`compare`. Live SGLang `--speculative-algorithm DFLASH` loads
+`DFlashLinearDraftModel` from the `yudigege86/sglang` `dflash-linear` fork
+(image `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x`).
 
 Capture replay (training forward on SGLang `.ckpt` features, no HF hidden
 states):
@@ -69,7 +70,7 @@ DRAFT_HF=z-lab/Qwen3.5-4B-DFlash \
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-speedbench-mal.sbatch
 ```
 
-Same split through stock SGLang `--speculative-algorithm DFLASH` (z-lab draft only; not `DFlashLinearDraftModel`), then compare to the offline JSON:
+Same split through stock SGLang `--speculative-algorithm DFLASH` (z-lab draft), then compare to the offline JSON:
 
 ```bash
 python scripts/eval/dflash_linear_eval.py sglang-mal \
@@ -82,4 +83,15 @@ python scripts/eval/dflash_linear_eval.py sglang-mal \
 
 COMPARE_JSON=/path/to/speedbench_mal.json \
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-speedbench-sglang.sbatch
+```
+
+0.5.18 image, M0 smoke, feature-contract check, stock rebaseline, linear parity:
+
+```bash
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-sglang-smoke.sbatch
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-feature-contract.sbatch
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-rebaseline.sbatch
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-parity.sbatch
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-m1-gates.sbatch
 ```

@@ -341,6 +341,7 @@ class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
         anchor_positions: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         block_keep_mask: Optional[torch.Tensor] = None,
+        prefix_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         batch, packed, hidden_size = hidden_states.shape
         block = self.block_size
@@ -363,7 +364,14 @@ class DFlashLinearDecoderLayer(GradientCheckpointingLayer):
                 f"= ({batch}, {num_anchors}), got {tuple(block_keep_mask.shape)}"
             )
         blocks = hidden_states.view(batch, num_anchors, block, hidden_size)
-        prefix_state = self.context_scan(fused_target, anchor_positions)
+        if prefix_state is None:
+            prefix_state = self.context_scan(fused_target, anchor_positions)
+        elif tuple(prefix_state.shape[:2]) != (batch, num_anchors):
+            raise ValueError(
+                "prefix_state must have shape "
+                f"(batch, num_anchors, H, K, V)=({batch}, {num_anchors}, ...), "
+                f"got {tuple(prefix_state.shape)}"
+            )
         residual = blocks
         normalized = self.input_layernorm(blocks)
         retrieved = self._context_read(normalized, prefix_state)
@@ -437,6 +445,7 @@ class DFlashLinearDraftModel(DFlashDraftModel):
         use_cache: bool = False,
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
+        prefix_states: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
         del attention_mask, past_key_values, use_cache, kwargs
@@ -458,13 +467,21 @@ class DFlashLinearDraftModel(DFlashDraftModel):
             )
         fused_target = self.hidden_norm(self.fc(target_hidden))
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        for layer in self.layers:
+        if prefix_states is not None and len(prefix_states) != len(self.layers):
+            raise ValueError(
+                "prefix_states must have one tensor per draft layer, "
+                f"got {len(prefix_states)} vs {len(self.layers)}"
+            )
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states = layer(
                 hidden_states=hidden_states,
                 fused_target=fused_target,
                 anchor_positions=anchor_positions,
                 position_embeddings=position_embeddings,
                 block_keep_mask=block_keep_mask,
+                prefix_state=(
+                    None if prefix_states is None else prefix_states[layer_idx]
+                ),
             )
         return self.norm(hidden_states)
 

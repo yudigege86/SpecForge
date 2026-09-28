@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPECFORGE_SRC="${SPECFORGE_SRC:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 
-RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.14-rocm700-mi35x}"
-IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.14-rocm700-mi35x.tar.zst}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x}"
+IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-dflash-linear-rocm700-mi35x.tar.zst}"
 HF_HOME="${HF_HOME:-/shared_nfs/naqin/hf-cache}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.5-4B}"
@@ -46,11 +46,17 @@ if [[ -z "${RESULTS_DIR:-}" ]]; then
   fi
 fi
 if [[ -z "${HIP_VISIBLE_DEVICES:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" && -z "${ROCR_VISIBLE_DEVICES:-}" ]]; then
-  HIP_VISIBLE_DEVICES=0
-  CUDA_VISIBLE_DEVICES=0
+  if [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    HIP_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+    CUDA_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+  else
+    HIP_VISIBLE_DEVICES=0
+    CUDA_VISIBLE_DEVICES=0
+  fi
 fi
 HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-${ROCR_VISIBLE_DEVICES:-0}}}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${HIP_VISIBLE_DEVICES}}"
+echo "resolved HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-}"
 
 if [[ -z "${HF_TOKEN:-}" ]]; then
   if [[ -f "${HOME}/.cache/huggingface/token" ]]; then
@@ -102,7 +108,11 @@ if ! run_docker image inspect "${RUNTIME_IMAGE}" >/dev/null 2>&1; then
   test -s "${IMAGE_ARCHIVE}"
   zstd -dc "${IMAGE_ARCHIVE}" | run_docker load
 fi
-run_docker image inspect "${RUNTIME_IMAGE}" --format '{{.Id}}'
+IMAGE_DIGEST="$(run_docker image inspect "${RUNTIME_IMAGE}" --format '{{.Id}}')"
+echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
+
+# shellcheck source=sglang-overlay-mounts.sh
+source "${SCRIPT_DIR}/sglang-overlay-mounts.sh"
 
 NAME="dflash-speedbench-sglang-${STAMP}"
 run_docker rm -f "${NAME}" >/dev/null 2>&1 || true
@@ -143,8 +153,15 @@ run_docker run --rm --name "${NAME}" \
   -e MEM_FRACTION="${MEM_FRACTION}" \
   -e SERVER_PORT="${SERVER_PORT}" \
   -e SLURM_JOB_ID="${SLURM_JOB_ID:-}" \
+  -e MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-1}" \
+  -e SGLANG_DFLASH_LINEAR_SHADOW_CHECK="${SGLANG_DFLASH_LINEAR_SHADOW_CHECK:-0}" \
+  -e SGLANG_GIT_SHA="${SGLANG_GIT_SHA:-}" \
+  -e IMAGE_DIGEST="${IMAGE_DIGEST}" \
+  -e RUNTIME_IMAGE="${RUNTIME_IMAGE}" \
+  -e OVERLAP_SCHEDULE="${OVERLAP_SCHEDULE:-1}" \
   -v /shared_nfs:/shared_nfs \
   -v "${SPECFORGE_SRC}:/workspace/SpecForge" \
+  "${OVERLAY_MOUNTS[@]}" \
   "${RUNTIME_IMAGE}" \
   bash /workspace/SpecForge/scripts/cluster/dflash-linear/inside-dflash-linear-speedbench-sglang.sh
 rc=$?

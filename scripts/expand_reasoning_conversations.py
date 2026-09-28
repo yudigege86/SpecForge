@@ -88,10 +88,10 @@ def validate_conversation(messages: Any) -> Optional[str]:
             continue
 
         reasoning = message.get("reasoning_content")
-        if not isinstance(reasoning, str) or not reasoning.strip():
+        if not isinstance(reasoning, str):
             return (
                 f"Invalid assistant reasoning_content at position {index}: "
-                "expected non-empty string"
+                "expected a string"
             )
         saw_assistant = True
 
