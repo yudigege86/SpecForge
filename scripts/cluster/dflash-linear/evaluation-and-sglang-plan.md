@@ -354,6 +354,8 @@ latency work, then the \(L\)-sweep.**
 
 | Item | Location |
 |---|---|
+| SGLang eval runbook | `docs/linear-context-dflash-sglang-eval.md` |
+| Status and future work | `docs/linear-context-dflash-sglang-status.md` |
 | Eval CLI | `SpecForge/scripts/eval/dflash_linear_eval.py` |
 | Cluster MAL / SGLang | `SpecForge/scripts/cluster/dflash-linear/` |
 | SGLang fork | `yudigege86/sglang` branch `dflash-linear` |

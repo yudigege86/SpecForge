@@ -4,6 +4,11 @@ Launchers for linear-context DFlash on the SPUR MI355X cluster. Data and
 results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`; this
 directory is the in-repo copy of the scripts.
 
+**Docs**
+
+- [How to run SGLang eval](../../../docs/linear-context-dflash-sglang-eval.md)
+- [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
+
 From a SpecForge checkout on the cluster:
 
 ```bash
