@@ -14,12 +14,15 @@ SPEED-Bench Qualitative `concat_user` as a z-lab card number.
 
 Companion note: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md).
 Cluster launchers: `scripts/cluster/dflash-linear/`.
+Image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
 
 ## What you need
 
 | Piece | Pin |
 |---|---|
 | SGLang | Fork `yudigege86/sglang` branch `dflash-linear` off `v0.5.18` (validated at `2a73ad467`) |
+| Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) (`FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`) |
+| Image build | [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
 | Image | `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` (digest `sha256:ce8ff833c63aba22ec9606817926e2f7109c95173f1692fbff7cb4d7429a8a30`) |
 | Archive | `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-dflash-linear-rocm700-mi35x.tar.zst` |
 | SpecForge | This branch (`dflash-linear`), eval CLI `scripts/eval/dflash_linear_eval.py` |
@@ -28,10 +31,21 @@ Cluster launchers: `scripts/cluster/dflash-linear/`.
 | 1-epoch export used for M1 | `/shared_nfs/naqin/Linear-Context-DFlash/eval-1epoch/20260918T213552Z/draft_hf` |
 | Training capture (contract) | `/shared_nfs/naqin/primus-specforge-smoke/qwen-capture-40k/valid-links` |
 
-The docker runner bind-mounts seven fork files over the image via
-`scripts/cluster/dflash-linear/sglang-overlay-mounts.sh`. Keep
-`SGLANG_SRC` pointed at a checkout of the fork (default
-`/shared_nfs/naqin/Linear-Context-DFlash/sglang`).
+The Dockerfile copies the seven linear DFLASH overlay files onto the
+published 0.5.18 ROCm image and applies
+`patches/sglang/v0.5.18/spec-capture.patch`. Eval jobs then bind-mount the
+same files again via
+[sglang-overlay-mounts.sh](../scripts/cluster/dflash-linear/sglang-overlay-mounts.sh)
+so a fork checkout can move without a rebuild. Keep `SGLANG_SRC` pointed at
+that checkout (default `/shared_nfs/naqin/Linear-Context-DFlash/sglang`).
+
+Rebuild on a compute node:
+
+```bash
+bash scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh
+# or
+sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch
+```
 
 Hard serving limits for this implementation (the server refuses otherwise):
 

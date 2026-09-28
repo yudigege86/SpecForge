@@ -1,6 +1,7 @@
 # Linear-context DFlash in SGLang: status and future work
 
 How to run eval: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md).
+Runtime image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
 
 Serving lives in `yudigege86/sglang` branch `dflash-linear` (off v0.5.18).
 Eval lives in this SpecForge branch. Same algorithm name `DFLASH`; the linear
@@ -72,6 +73,8 @@ SpecForge:
 | File | Role |
 |---|---|
 | `scripts/eval/dflash_linear_eval.py` | `prepare`, `mal`, `sglang-mal`, `compare-mal`, `feature-contract-check` |
+| [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) | Overlay fork files + spec-capture patch onto `lmsysorg/sglang:v0.5.18-rocm700-mi35x` |
+| [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh) | Stages the Dockerfile and tags `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` |
 | `scripts/cluster/dflash-linear/` | Docker/sbatch launchers, overlay mounts |
 | `specforge/modeling/draft/dflash_linear.py` | Training / teacher-force draft |
 | `specforge/modeling/draft/linear_context.py` | `commit_block_masked` reference |

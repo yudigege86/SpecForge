@@ -8,6 +8,7 @@ directory is the in-repo copy of the scripts.
 
 - [How to run SGLang eval](../../../docs/linear-context-dflash-sglang-eval.md)
 - [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
+- [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — `FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`; build with [build-sglang-0.5.18-image.sh](./build-sglang-0.5.18-image.sh)
 
 From a SpecForge checkout on the cluster:
 
