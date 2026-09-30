@@ -7,6 +7,7 @@ results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`.
 
 - [How to run SGLang eval](../../../docs/linear-context-dflash-sglang-eval.md)
 - [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
+- [Configs: default vs no-ctx-residual vs qkv](../../../docs/linear-context-dflash-variants.md)
 - [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — eval overlay on `lmsysorg/sglang:v0.5.18-rocm700-mi35x`
 - [Dockerfile.sglang-0.5.18-train](./Dockerfile.sglang-0.5.18-train) — same base plus FLA/tensorboard for offline 1-epoch train (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`)
 

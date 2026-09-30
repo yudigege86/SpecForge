@@ -12,7 +12,8 @@ averaged per prompt (HumanEval) or per turn (MT-Bench turn 1). Do not use
 mean block accept length, HuggingFace `hidden_states` teacher-force, or
 SPEED-Bench Qualitative `concat_user` as a z-lab card number.
 
-Companion note: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md).
+Companion notes: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md),
+[linear-context-dflash-variants.md](./linear-context-dflash-variants.md).
 Cluster launchers: `scripts/cluster/dflash-linear/`.
 Image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
 Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
