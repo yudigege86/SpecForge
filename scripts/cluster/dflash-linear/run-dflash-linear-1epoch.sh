@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPECFORGE_SRC="${SPECFORGE_SRC:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 SMOKE_DIR="${SMOKE_DIR:-${SCRIPT_DIR}}"
 
-RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.14-rocm700-mi35x}"
-IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.14-rocm700-mi35x.tar.zst}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.18-train-rocm700-mi35x}"
+IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-train-rocm700-mi35x.tar.zst}"
 RESULTS_DIR="${RESULTS_DIR:-/shared_nfs/naqin/Linear-Context-DFlash/train-1epoch}"
 HF_HOME="${HF_HOME:-/shared_nfs/naqin/hf-cache}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
@@ -18,9 +18,19 @@ RUN_DIR="${RESULTS_DIR}/${STAMP}"
 mkdir -p "${RUN_DIR}"
 exec > >(tee "${RUN_DIR}/run.log") 2>&1
 
+if [[ -z "${HIP_VISIBLE_DEVICES:-}" && -z "${CUDA_VISIBLE_DEVICES:-}" && -z "${ROCR_VISIBLE_DEVICES:-}" ]]; then
+  if [[ -n "${SLURM_JOB_GPUS:-}" ]]; then
+    HIP_VISIBLE_DEVICES="${SLURM_JOB_GPUS}"
+  else
+    HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+  fi
+fi
+HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-${CUDA_VISIBLE_DEVICES:-${ROCR_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${HIP_VISIBLE_DEVICES}}"
+
 echo "host=$(hostname) stamp=${STAMP} image=${RUNTIME_IMAGE}"
 echo "job=${SLURM_JOB_ID:-none} node=${SLURMD_NODENAME:-$(hostname)}"
-echo "HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES:-} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+echo "resolved HIP_VISIBLE_DEVICES=${HIP_VISIBLE_DEVICES} CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES} SLURM_JOB_GPUS=${SLURM_JOB_GPUS:-}"
 echo "SPECFORGE_SRC=${SPECFORGE_SRC}"
 echo "HIDDEN_STATES_PATH=${HIDDEN_STATES_PATH}"
 

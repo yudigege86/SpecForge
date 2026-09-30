@@ -1,5 +1,5 @@
 #!/bin/bash
-# 1-epoch dflash_linear train inside naqin/primus-specforge:v0.5.14-rocm700-mi35x.
+# 1-epoch dflash_linear train inside the 0.5.18 ROCm train image.
 set -euo pipefail
 
 cd /workspace/SpecForge
@@ -22,17 +22,21 @@ echo "=== pip install -e . --no-deps ==="
 pip install -e . --no-deps
 
 echo "=== tensorboard (SummaryWriter) ==="
-pip install tensorboard
+python3 - <<'PY'
+try:
+    from torch.utils.tensorboard import SummaryWriter  # noqa: F401
+    print("tensorboard_already_present")
+except Exception as exc:
+    raise SystemExit(f"tensorboard missing in train image: {exc}")
+PY
 
-echo "=== install flash-linear-attention[rocm] without replacing image torch ==="
-# Do not pip-install torch from download.pytorch.org/whl/rocm7.2: this image
-# already has a working ROCm torch. The [rocm] extra only pins torch>=2.7.0.
+echo "=== FLA (baked into 0.5.18 train image) ==="
 python3 - <<'PY'
 import torch
-print("torch_before_fla", torch.__version__, "hip", getattr(torch.version, "hip", None))
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+print("torch", torch.__version__, "hip", getattr(torch.version, "hip", None))
+print("fla_chunk", chunk_gated_delta_rule)
 PY
-pip install einops
-pip install 'flash-linear-attention[rocm]'
 
 echo "=== torch / FLA / dataset / tensorboard preflight ==="
 python3 - <<'PY'

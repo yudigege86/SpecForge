@@ -7,7 +7,8 @@ results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`.
 
 - [How to run SGLang eval](../../../docs/linear-context-dflash-sglang-eval.md)
 - [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
-- [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — `FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`; build with [build-sglang-0.5.18-image.sh](./build-sglang-0.5.18-image.sh)
+- [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — eval overlay on `lmsysorg/sglang:v0.5.18-rocm700-mi35x`
+- [Dockerfile.sglang-0.5.18-train](./Dockerfile.sglang-0.5.18-train) — same base plus FLA/tensorboard for offline 1-epoch train (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`)
 
 Live card MAL is SGLang `--speculative-algorithm DFLASH` plus
 `scripts/eval/dflash_linear_eval.py` (`sglang-mal`, then `mal --replay-json`
@@ -100,6 +101,14 @@ sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-feature-contract.sbat
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-rebaseline.sbatch
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-parity.sbatch
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-m1-gates.sbatch
+```
+
+0.5.18 train image + 1-epoch redo on the existing 40k capture (no recapture).
+Image build is 1 GPU burst; 8-GPU 1-epoch train also uses `amd-burst-qos`:
+
+```bash
+IMG=$(sbatch --parsable scripts/cluster/dflash-linear/cluster-dflash-linear-train-image.sbatch)
+sbatch --dependency=afterok:${IMG} scripts/cluster/dflash-linear/cluster-dflash-linear-1epoch.sbatch
 ```
 
 Training-era launchers (`cluster-dflash-linear-1epoch.sbatch`, naive-steps,

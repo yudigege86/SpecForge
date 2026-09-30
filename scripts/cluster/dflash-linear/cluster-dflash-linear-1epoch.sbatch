@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=amd-brain-models
-# brain-models is at QOSGrpNodeLimit (~8 running); burst is preemptible.
+# 1-epoch train on burst (preemptible; --requeue). Partition wall is 1 day.
 #SBATCH --qos=amd-burst-qos
 #SBATCH --partition=amd-spur
 #SBATCH --nodes=1
@@ -10,11 +10,14 @@
 #SBATCH --job-name=dflin-1ep
 #SBATCH --output=/shared_nfs/naqin/Linear-Context-DFlash/train-1epoch/sbatch-%j.out
 #SBATCH --requeue
-# Do not pack onto the running sf-online allocation.
-#SBATCH --exclude=crsuse2-m2m-012,crsuse2-m2m-023,crsuse2-m2m-042,crsuse2-m2m-150,crsuse2-m2m-226,crsuse2-m2m-251
+#SBATCH --export=ALL
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FALLBACK="/shared_nfs/naqin/Linear-Context-DFlash/SpecForge/scripts/cluster/dflash-linear"
+if [[ ! -f "${SCRIPT_DIR}/run-dflash-linear-1epoch.sh" ]]; then
+  SCRIPT_DIR="${FALLBACK}"
+fi
 mkdir -p /shared_nfs/naqin/Linear-Context-DFlash/train-1epoch
 cd "${SCRIPT_DIR}"
-bash run-dflash-linear-1epoch.sh
+bash "${SCRIPT_DIR}/run-dflash-linear-1epoch.sh"

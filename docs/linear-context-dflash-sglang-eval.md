@@ -24,6 +24,7 @@ Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 |---|---|
 | SGLang | Fork `yudigege86/sglang` branch `dflash-linear` off `v0.5.18` (validated at `2a73ad467`) |
 | Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) (`FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`) |
+| Train image | [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`, FLA baked in) |
 | Image build | [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
 | Image | `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` (digest `sha256:ce8ff833c63aba22ec9606817926e2f7109c95173f1692fbff7cb4d7429a8a30`) |
 | Archive | `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-dflash-linear-rocm700-mi35x.tar.zst` |

@@ -2,6 +2,7 @@
 
 How to run eval: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md).
 Runtime image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
+Train image: [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train).
 
 Serving lives in `yudigege86/sglang` branch `dflash-linear` (off v0.5.18).
 Eval lives in this SpecForge branch. Same algorithm name `DFLASH`; the linear
@@ -74,6 +75,7 @@ SpecForge:
 |---|---|
 | `scripts/eval/dflash_linear_eval.py` | `prepare`, `mal`, `sglang-mal`, `compare-mal`, `feature-contract-check` |
 | [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) | Overlay fork files + spec-capture patch onto `lmsysorg/sglang:v0.5.18-rocm700-mi35x` |
+| [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) | Same base + FLA/tensorboard; tag `naqin/primus-specforge:v0.5.18-train-rocm700-mi35x` |
 | [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh) | Stages the Dockerfile and tags `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` |
 | `scripts/cluster/dflash-linear/` | Docker/sbatch launchers, overlay mounts |
 | `scripts/cluster/dflash-linear/archive/` | Pre-SGLang HuggingFace `spec_generate` serve/eval (do not use) |
