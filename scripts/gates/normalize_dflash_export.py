@@ -16,6 +16,10 @@ _DSPARK_TOP_LEVEL_FIELDS = (
 )
 _DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
 _DFLASH_LINEAR_ARCHITECTURE = "DFlashLinearDraftModel"
+_DFLASH2_LINEAR_ARCHITECTURE = "DFlash2LinearDraftModel"
+_LINEAR_FAMILY_ARCHITECTURES = frozenset(
+    {_DFLASH_LINEAR_ARCHITECTURE, _DFLASH2_LINEAR_ARCHITECTURE}
+)
 _DFLASH2_FIELDS = (
     "conv_group_size",
     "conv_kernel_size",
@@ -28,27 +32,43 @@ def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def _require_dflash2_fields(method_config: Dict[str, Any], *, label: str) -> None:
+    for key in _DFLASH2_FIELDS:
+        value = method_config.get(key)
+        if not _positive_integer(value):
+            raise ValueError(
+                f"{label} export requires a positive integer dflash_config.{key}, "
+                f"got {value!r}"
+            )
+
+
+def _require_linear_context(method_config: Dict[str, Any], *, label: str) -> None:
+    linear = method_config.get("linear_context")
+    if not isinstance(linear, dict) or not linear:
+        raise ValueError(
+            f"{label} export requires a non-empty dflash_config.linear_context"
+        )
+
+
 def _normalize_dflash_linear(
     config: Dict[str, Any], method_config: Dict[str, Any]
 ) -> None:
     """Keep the linear draft class; SGLang's stock DFLASH loader cannot serve it."""
 
-    linear = method_config.get("linear_context")
-    if not isinstance(linear, dict) or not linear:
-        raise ValueError(
-            "DFlashLinear export requires a non-empty dflash_config.linear_context"
-        )
+    _require_linear_context(method_config, label="DFlashLinear")
     config["architectures"] = [_DFLASH_LINEAR_ARCHITECTURE]
 
 
+def _normalize_dflash2_linear(
+    config: Dict[str, Any], method_config: Dict[str, Any]
+) -> None:
+    _require_linear_context(method_config, label="DFlash2Linear")
+    _require_dflash2_fields(method_config, label="DFlash2Linear")
+    config["architectures"] = [_DFLASH2_LINEAR_ARCHITECTURE]
+
+
 def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
-    for key in _DFLASH2_FIELDS:
-        value = method_config.get(key)
-        if not _positive_integer(value):
-            raise ValueError(
-                f"DFlash2 export requires a positive integer dflash_config.{key}, "
-                f"got {value!r}"
-            )
+    _require_dflash2_fields(method_config, label="DFlash2")
     config["architectures"] = [_DFLASH2_ARCHITECTURE]
 
 
@@ -141,12 +161,16 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
         )
 
     keep_auto_map = False
-    if _DFLASH_LINEAR_ARCHITECTURE in (config.get("architectures") or []):
+    architectures = config.get("architectures") or []
+    if _DFLASH2_LINEAR_ARCHITECTURE in architectures:
+        _normalize_dflash2_linear(config, method_config)
+        keep_auto_map = True
+    elif _DFLASH_LINEAR_ARCHITECTURE in architectures:
         _normalize_dflash_linear(config, method_config)
         keep_auto_map = True
     elif projector_type == "dspark":
         _normalize_dspark(config, method_config)
-    elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
+    elif _DFLASH2_ARCHITECTURE in architectures:
         _normalize_dflash2(config, method_config)
     else:
         config["architectures"] = ["DFlashDraftModel"]
@@ -155,7 +179,10 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
         handle.write("\n")
-    if _DFLASH_LINEAR_ARCHITECTURE in (config.get("architectures") or []):
+    if any(
+        name in (config.get("architectures") or [])
+        for name in _LINEAR_FAMILY_ARCHITECTURES
+    ):
         contract_path = path.parent / "feature_contract.json"
         contract = {
             "capture_implementation": "sglang_dflash_aux",

@@ -1,8 +1,9 @@
 """Built-in linear-context DFlash registration and executable providers.
 
 Reuses DFlash target-feature capture, sampled-anchor training, and the frozen
-LM head. The draft architecture is ``DFlashLinearDraftModel`` so later work can
-replace context KV without touching stock DFlash.
+LM head. The default draft class is ``DFlashLinearDraftModel``.
+``DFlash2LinearDraftModel`` is a compatible architecture on the same strategy
+(local grouped conv plus candidate selector).
 """
 
 from __future__ import annotations
@@ -43,7 +44,10 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dflash_linear"
 DRAFT_ARCHITECTURE = "DFlashLinearDraftModel"
-COMPATIBLE_DRAFT_ARCHITECTURES = frozenset({DRAFT_ARCHITECTURE})
+DFLASH2_LINEAR_DRAFT_ARCHITECTURE = "DFlash2LinearDraftModel"
+COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
+    {DRAFT_ARCHITECTURE, DFLASH2_LINEAR_DRAFT_ARCHITECTURE}
+)
 _RESUME_PREFIXES = ("dflash2_", "dflash_")
 
 

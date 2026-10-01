@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Offline teacher-forced MAL for DFlash-family drafts.
 
-Accepts stock ``DFlashDraftModel`` and ``DFlashLinearDraftModel`` exports.
+Accepts stock ``DFlashDraftModel``, ``DFlashLinearDraftModel``, and
+``DFlash2LinearDraftModel`` exports.
 Datasets: SPEED-Bench Qualitative, HumanEval, and MT-Bench. Generation stops
 at EOS; reports overall and per-category mean accept length.
 """

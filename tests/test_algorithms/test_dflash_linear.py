@@ -26,6 +26,15 @@ STOCK_DFLASH_RECIPE = (
     / "qwen3.5-4b-dflash-offline-amd.yaml"
 )
 DRAFT_CONFIG = REPO_ROOT / "configs" / "qwen3.5-4b-dflash-linear.json"
+DFLASH2_RECIPE = (
+    REPO_ROOT
+    / "examples"
+    / "configs"
+    / "offline"
+    / "colocated"
+    / "qwen3.5-4b-dflash2-linear-offline.yaml"
+)
+DFLASH2_DRAFT_CONFIG = REPO_ROOT / "configs" / "qwen3.5-4b-dflash2-linear.json"
 
 
 def _yaml_scalar(path: Path, key: str) -> str:
@@ -57,6 +66,10 @@ class DFlashLinearRegistrationTest(unittest.TestCase):
             "DFlashLinearDraftModel",
         )
         self.assertEqual(
+            linear.spec.draft.compatible_architectures,
+            frozenset({"DFlashLinearDraftModel", "DFlash2LinearDraftModel"}),
+        )
+        self.assertEqual(
             linear.providers.offline_for("text").capture_layout.capture_method,
             "dflash",
         )
@@ -80,6 +93,55 @@ class DFlashLinearRegistrationTest(unittest.TestCase):
         self.assertEqual(linear_context["injection"], "gated_residual")
         self.assertTrue(linear_context["context_residual"])
         self.assertEqual(_yaml_scalar(RECIPE, "attention_backend"), "sdpa")
+
+    def test_qwen35_4b_dflash2_linear_recipe_wires_conv_and_selector(self):
+        self.assertEqual(_yaml_scalar(DFLASH2_RECIPE, "strategy"), "dflash_linear")
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "target_model_path"),
+            "Qwen/Qwen3.5-4B",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "draft_model_config"),
+            "configs/qwen3.5-4b-dflash2-linear.json",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "hidden_states_path"),
+            "./cache/hidden_states/qwen3.5-4b-dflash-sharegpt",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "dflash2_selector_loss_alpha"),
+            "1.0",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "dflash2_selector_warmup_ratio"),
+            "0.0005",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "dflash2_selector_ramp_ratio"),
+            "0.0005",
+        )
+        self.assertEqual(
+            _yaml_scalar(DFLASH2_RECIPE, "dflash2_selector_stop_gradient"),
+            "false",
+        )
+        payload = json.loads(DFLASH2_DRAFT_CONFIG.read_text())
+        self.assertEqual(payload["architectures"], ["DFlash2LinearDraftModel"])
+        self.assertEqual(
+            payload["auto_map"]["AutoModel"],
+            "dflash2_linear.DFlash2LinearDraftModel",
+        )
+        self.assertEqual(payload["block_size"], 16)
+        method = payload["dflash_config"]
+        self.assertEqual(method["target_layer_ids"], [1, 8, 15, 22, 29])
+        self.assertEqual(method["conv_kernel_size"], 2)
+        self.assertEqual(method["conv_group_size"], 16)
+        self.assertEqual(method["selector_rank"], 256)
+        self.assertEqual(method["selector_top_k"], 16)
+        linear_context = method["linear_context"]
+        self.assertEqual(linear_context["variant"], "gdn")
+        self.assertEqual(linear_context["injection"], "gated_residual")
+        self.assertTrue(linear_context["context_residual"])
+        self.assertEqual(_yaml_scalar(DFLASH2_RECIPE, "attention_backend"), "sdpa")
 
     def test_ablation_recipes_are_first_class_config(self):
         ablations = {

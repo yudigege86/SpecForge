@@ -1,14 +1,15 @@
 # Linear-context DFlash: configs and algorithms
 
-Every checked-in linear recipe is the same **training strategy**
-(`dflash_linear`) and the same **draft class** (`DFlashLinearDraftModel`).
-They differ only in `dflash_config.linear_context`. Stock concat-KV DFlash
-(`training.strategy: dflash`, `DFlashDraftModel`) is a different algorithm
-and is not listed here.
+Every checked-in linear recipe uses **training strategy** `dflash_linear`.
+The default draft class is `DFlashLinearDraftModel`. DFlash2-linear is the
+same strategy with local convolution and a candidate selector
+(`DFlash2LinearDraftModel`). Stock concat-KV DFlash (`training.strategy:
+dflash`, `DFlashDraftModel`) is a different algorithm and is not listed here.
 
 Eval and serving: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md),
 [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md).
-Layer code: `specforge/modeling/draft/dflash_linear.py`.
+Layer code: `specforge/modeling/draft/dflash_linear.py`,
+`specforge/modeling/draft/dflash2_linear.py`.
 
 ## Shared backbone
 
@@ -32,7 +33,7 @@ All Qwen3.5-4B linear JSONs share:
 
 | Field | Value |
 |---|---|
-| `architectures` | `DFlashLinearDraftModel` |
+| `architectures` | `DFlashLinearDraftModel` or `DFlash2LinearDraftModel` |
 | `block_size` | 16 |
 | `target_layer_ids` | `[1, 8, 15, 22, 29]` (5 draft layers) |
 | `mask_token_id` | 248070 |
@@ -45,7 +46,8 @@ All Qwen3.5-4B linear JSONs share:
 Training YAML always sets `training.strategy: dflash_linear` and points
 `model.draft_model_config` at one of the JSONs below. A 1-epoch cluster
 recipe (`scripts/cluster/dflash-linear/qwen3.5-4b-dflash-linear-1epoch.yaml`)
-uses the **default** JSON.
+uses the **default** JSON. DFlash2-linear 1-epoch is
+`scripts/cluster/dflash-linear/qwen3.5-4b-dflash2-linear-1epoch.yaml`.
 
 Checkpoints are **not** interchangeable across variants: missing or extra
 modules (`inject_gate`, `q_r_proj`, `context_residual`, KDA vs GDN gate
@@ -90,13 +92,14 @@ into Q/K/V, but no post-attention skip from \(r\).
 
 ## Checked-in recipes
 
-Short names match the JSON / YAML suffixes. All live under
-`configs/qwen3.5-4b-dflash-linear*.json` and
-`examples/configs/offline/colocated/qwen3.5-4b-dflash-linear*-offline.yaml`.
+Short names match the JSON / YAML suffixes. Injection ablations live under
+`configs/qwen3.5-4b-dflash-linear*.json`. DFlash2-linear is
+`configs/qwen3.5-4b-dflash2-linear.json`.
 
 | Short name | JSON | `variant` | `injection` | `context_residual` | What it tests |
 |---|---|---|---|---|---|
 | **dflash-linear** (default) | `configs/qwen3.5-4b-dflash-linear.json` | gdn | gated_residual | true | Context-first GDN: gate retrieved features into the block, then residual-add them after attention. This is the main architecture and the 1-epoch train. |
+| **dflash2-linear** | `configs/qwen3.5-4b-dflash2-linear.json` | gdn | gated_residual | true | Same GDN retrieve as default, plus DFlash2 grouped conv around **local** B×B attention and MLP, and a top-k candidate selector. Conv does not wrap the GDN scan or prefix read. |
 | **no-ctx-residual** | `configs/qwen3.5-4b-dflash-linear-no-ctx-residual.json` | gdn | gated_residual | false | Same gated injection, but retrieved context cannot skip around attention. Isolates whether the post-attn residual is load-bearing. |
 | **qkv** | `configs/qwen3.5-4b-dflash-linear-qkv.json` | gdn | qkv_conditioning | true | Direct Q/K/V conditioning instead of a gated residual on \(h\). Paper hypothesis: this preserves more acceptance than independent branches. |
 | independent | `configs/qwen3.5-4b-dflash-linear-independent.json` | gdn | independent | true | Parallel GDN-context and dense-local branches. Context only via \(W_r r\). |
@@ -106,13 +109,15 @@ Train one of them:
 
 ```bash
 specforge train -c examples/configs/offline/colocated/qwen3.5-4b-dflash-linear-offline.yaml
+specforge train -c examples/configs/offline/colocated/qwen3.5-4b-dflash2-linear-offline.yaml
 specforge train -c examples/configs/offline/colocated/qwen3.5-4b-dflash-linear-no-ctx-residual-offline.yaml
 specforge train -c examples/configs/offline/colocated/qwen3.5-4b-dflash-linear-qkv-offline.yaml
 ```
 
-Offline feature caches from stock DFlash capture are valid for all five.
+Offline feature caches from stock DFlash capture are valid for all of these.
 Do not mix a checkpoint trained on one JSON with another JSON at export
-or serve time.
+or serve time. DFlash2-linear checkpoints are not loadable as
+`DFlashLinearDraftModel` (extra conv and selector modules).
 
 ## The three named ablations
 
@@ -167,12 +172,30 @@ injection”. Weight count grows by three retrieved-bias linears
 (`q_r_proj`, `k_r_proj`, `v_r_proj`) and drops the two gated-residual
 linears.
 
+### dflash2-linear
+
+Same GDN gated-residual backbone as the default. `DFlashGroupedConv`
+wraps **only** dense B×B attention and the MLP. The GDN/KDA scan and
+prefix read stay unconvolved: local conv is a local-coherence correction,
+not a retrieval filter. `CandidateSelector` re-ranks the frozen target
+head’s top-k tokens the same way stock DFlash2 does.
+
+JSON extras: `conv_kernel_size: 2`, `conv_group_size: 16` (must divide
+hidden 2560), `selector_rank: 256`, `selector_top_k: 16`. Block size
+stays 16. YAML keeps `training.strategy: dflash_linear` and adds the
+DFlash2 selector-loss schedule. Checkpoints are not loadable as
+`DFlashLinearDraftModel`.
+
 ## Serving
 
 SGLang still uses `--speculative-algorithm DFLASH`. The worker is chosen
 from `architectures[0] == "DFlashLinearDraftModel"`. Injection and
 `context_residual` are read from the exported `config.json`; there is no
 extra serve flag.
+
+`DFlash2LinearDraftModel` is a SpecForge training and Hugging Face export
+class. Offline MAL / capture-replay load it through `AutoDraftModel`.
+This repo’s SGLang overlay does not dispatch that architecture yet.
 
 The 1-epoch export used for M1 is the **default** gated-residual GDN
 drafter. A qkv or no-ctx-residual export is a different model: rebuild

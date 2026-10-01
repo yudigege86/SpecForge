@@ -156,9 +156,15 @@ def cmd_replay(args: argparse.Namespace) -> int:
     draft.to(device)
     draft.eval()
     draft_cfg = json.loads(Path(args.draft, "config.json").read_text(encoding="utf-8"))
-    print("architectures", draft_cfg.get("architectures"), flush=True)
-    if "DFlashLinearDraftModel" not in (draft_cfg.get("architectures") or []):
-        raise SystemExit("draft export is not DFlashLinearDraftModel")
+    architectures = draft_cfg.get("architectures") or []
+    print("architectures", architectures, flush=True)
+    if (
+        "DFlashLinearDraftModel" not in architectures
+        and "DFlash2LinearDraftModel" not in architectures
+    ):
+        raise SystemExit(
+            "draft export is not DFlashLinearDraftModel or DFlash2LinearDraftModel"
+        )
 
     print(f"loading target embed/head {args.target}", flush=True)
     target_parts = TargetEmbeddingsAndHead.from_pretrained(
