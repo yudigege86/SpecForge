@@ -4,7 +4,8 @@
 #SBATCH --partition=amd-spur
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
 #SBATCH --time=04:00:00
 #SBATCH --job-name=dflin-fcheck
 #SBATCH --output=/shared_nfs/naqin/Linear-Context-DFlash/mal-eval/feature-contract/sbatch-%j.out

@@ -13,5 +13,5 @@
 
 set -euo pipefail
 mkdir -p /shared_nfs/naqin/Linear-Context-DFlash/docker-build
-SCRIPT="/shared_nfs/naqin/Linear-Context-DFlash/SpecForge/scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh"
+SCRIPT="/shared_nfs/naqin/Linear-Context-DFlash/SpecForge/scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh"
 bash "${SCRIPT}"

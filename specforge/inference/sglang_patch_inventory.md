@@ -1,6 +1,6 @@
 # SGLang patch inventory and supported version
 
-SpecForge pins `sglang==0.5.18` by default. A separately versioned patch supports
+SpecForge pins `sglang==0.5.19` by default. A separately versioned patch supports
 the Kimi K3 SGLang fork at the current validated `kimi-k3` branch tip `9acd9cb`
 (and its original `f8493a4` integration point). There are deliberately separate
 SGLang integration surfaces.
@@ -11,6 +11,7 @@ Online training uses one of these source-specific patches:
 
 | Target | Patch | Capture methods |
 |---|---|---|
+| SGLang v0.5.19 | [`patches/sglang/v0.5.19/spec-capture.patch`](../../patches/sglang/v0.5.19/spec-capture.patch) | EAGLE3, DFlash, DFlash2, DSpark |
 | SGLang v0.5.18 | [`patches/sglang/v0.5.18/spec-capture.patch`](../../patches/sglang/v0.5.18/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 | Kimi K3 SGLang `9acd9cb` (`f8493a4` compatible) | [`patches/sglang/kimi-k3-f8493a4/spec-capture.patch`](../../patches/sglang/kimi-k3-f8493a4/spec-capture.patch) | EAGLE3, DFlash, DSpark |
 
@@ -42,7 +43,7 @@ providers map generic server artifacts (`aux`, `last_hidden`, passthrough
 inputs) to training feature names. No trainer or producer process imports
 SGLang model-runner internals or loads a target model.
 
-The default patch is dry-run validated against the v0.5.18 tag. Capture requests
+The default patch is dry-run validated against the v0.5.19 tag. Capture requests
 carry a unique `extra_key`, so every training sample executes a full prefill even
 when radix cache support is present. Managed-local launch preserves the
 historical disabled-cache default; hybrid targets that require the unified radix
@@ -57,7 +58,7 @@ Apply the default patch with `scripts/apply_sglang_spec_capture_patch.sh`, or
 the K3 patch with
 `scripts/apply_sglang_spec_capture_patch.sh --target kimi-k3-9acd9cb`.
 On the default patch, `--spec-capture-method dspark` rides the DFlash aux
-plumbing (`set_dflash_layers_to_capture`), which stock v0.5.18 models, including
+plumbing (`set_dflash_layers_to_capture`), which stock v0.5.19 models, including
 Inkling, implement; DSpark and DFlash capture the same aux/last-hidden artifacts,
 so managed-local DSpark launches work unchanged. The K3 patch instead routes
 `--spec-capture-method dspark` to the model's dedicated

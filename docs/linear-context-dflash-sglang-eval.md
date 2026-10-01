@@ -15,7 +15,7 @@ SPEED-Bench Qualitative `concat_user` as a z-lab card number.
 Companion notes: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md),
 [linear-context-dflash-variants.md](./linear-context-dflash-variants.md).
 Cluster launchers: `scripts/cluster/dflash-linear/`.
-Image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
+Image: [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19).
 Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 [scripts/cluster/dflash-linear/archive/](../scripts/cluster/dflash-linear/archive/).
 
@@ -23,30 +23,33 @@ Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 
 | Piece | Pin |
 |---|---|
-| SGLang | Fork `yudigege86/sglang` branch `dflash-linear` off `v0.5.18` (validated at `2a73ad467`) |
-| Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) (`FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x`) |
-| Train image | [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`, FLA baked in) |
-| Image build | [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
-| Image | `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` (digest `sha256:ce8ff833c63aba22ec9606817926e2f7109c95173f1692fbff7cb4d7429a8a30`) |
-| Archive | `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-dflash-linear-rocm700-mi35x.tar.zst` |
-| SpecForge | This branch (`dflash-linear`), eval CLI `scripts/eval/dflash_linear_eval.py` |
+| SGLang | Fork `yudigege86/sglang` branch `dflash-linear-v0.5.19` off `v0.5.19` (`0bcd822377` + linear cherry-picks). Keep `dflash-linear` as the validated 0.5.18 history (`2a73ad467`) |
+| Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19) (`FROM lmsysorg/sglang:v0.5.19-rocm700-mi35x`) |
+| Train image | [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`, FLA baked in). Do not rebuild unless the feature-contract gate fails |
+| Image build | [build-sglang-0.5.19-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
+| Image | `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x` (digest filled after the burst image build) |
+| Archive | `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.19-dflash-linear-rocm700-mi35x.tar.zst` |
+| Previous M1 eval image | `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` (digest `sha256:ce8ff833c63aba22ec9606817926e2f7109c95173f1692fbff7cb4d7429a8a30`) |
+| SpecForge | This branch (`dflash-linear`), eval CLI `scripts/eval/dflash_linear_eval.py`, `sglang==0.5.19` |
 | Target | `Qwen/Qwen3.5-4B` (other targets need a feature-contract check first) |
 | Linear draft | HF export whose `architectures` is `["DFlashLinearDraftModel"]` |
 | 1-epoch export used for M1 | `/shared_nfs/naqin/Linear-Context-DFlash/eval-1epoch/20260918T213552Z/draft_hf` |
 | Training capture (contract) | `/shared_nfs/naqin/primus-specforge-smoke/qwen-capture-40k/valid-links` |
 
 The Dockerfile copies the seven linear DFLASH overlay files onto the
-published 0.5.18 ROCm image and applies
-`patches/sglang/v0.5.18/spec-capture.patch`. Eval jobs then bind-mount the
-same files again via
+published 0.5.19 ROCm image and applies
+`patches/sglang/v0.5.19/spec-capture.patch`. It does **not** overlay
+`models/dflash.py`; `DFlash2DraftModel` comes from the base image. Eval jobs
+then bind-mount the same files again via
 [sglang-overlay-mounts.sh](../scripts/cluster/dflash-linear/sglang-overlay-mounts.sh)
-so a fork checkout can move without a rebuild. Keep `SGLANG_SRC` pointed at
-that checkout (default `/shared_nfs/naqin/Linear-Context-DFlash/sglang`).
+so a fork checkout can move without a rebuild. Keep `SGLANG_SRC` on
+`dflash-linear-v0.5.19` (default `/shared_nfs/naqin/Linear-Context-DFlash/sglang`).
+A 0.5.18 checkout would clobber DFlash2 worker hooks on the 0.5.19 image.
 
 Rebuild on a compute node:
 
 ```bash
-bash scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh
+bash scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh
 # or
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch
 ```
@@ -148,7 +151,7 @@ masked naive verify after every commit. It is O(commits²) and makes HE n=16
 take on the order of an hour per scheduler setting. Turn it off for
 throughput runs; leave it on when checking state ownership.
 
-### Feature contract (training capture vs 0.5.18 live aux)
+### Feature contract (training capture vs 0.5.19 live aux)
 
 ```bash
 export HIDDEN_STATES_PATH=/shared_nfs/naqin/primus-specforge-smoke/qwen-capture-40k/valid-links
@@ -173,8 +176,8 @@ Use this dump as `STOCK_MAL_JSON` when you want stock-vs-linear
 
 Works inside the runtime image or any env with the fork installed
 (`pip install -e python --no-deps` from `yudigege86/sglang`) and
-`patches/sglang/v0.5.18/spec-capture.patch` applied for aux replay
-(`scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18`).
+`patches/sglang/v0.5.19/spec-capture.patch` applied for aux replay
+(`scripts/apply_sglang_spec_capture_patch.sh --target v0.5.19`).
 
 ```bash
 python3 -m sglang.launch_server \
@@ -295,7 +298,7 @@ fail). On the 1-epoch draft, HE n=16 was live **2.459** vs replay **2.448**
 (0.42%) at batch 1/4 and overlap on/off.
 
 A 1-epoch linear MAL near 2.5 is the drafter, not a broken server. Stock
-concat-KV on the same 0.5.18 image is about 7.9 on HE n=16.
+concat-KV on the 0.5.18 M1 image is about 7.9 on HE n=16.
 
 ## Common failures
 

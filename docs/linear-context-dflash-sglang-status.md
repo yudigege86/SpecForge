@@ -2,12 +2,14 @@
 
 How to run eval: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md).
 Configs (default, no-ctx-residual, qkv): [linear-context-dflash-variants.md](./linear-context-dflash-variants.md).
-Runtime image: [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18).
+Runtime image: [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19).
 Train image: [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train).
 
-Serving lives in `yudigege86/sglang` branch `dflash-linear` (off v0.5.18).
-Eval lives in this SpecForge branch. Same algorithm name `DFLASH`; the linear
-draft is dispatched when `architectures[0] == "DFlashLinearDraftModel"`.
+Serving lives in `yudigege86/sglang` branch `dflash-linear-v0.5.19` (off v0.5.19).
+The validated 0.5.18 history stays on `dflash-linear` (`2a73ad467`). Eval lives
+in this SpecForge branch. Same algorithm name `DFLASH`; the linear draft is
+dispatched when `architectures[0] == "DFlashLinearDraftModel"`. Stock DFlash2
+(`DFlash2DraftModel`) stays on `DFlashWorkerV2`.
 
 ## Current status (M1 landed)
 
@@ -59,15 +61,17 @@ Invariant: state before a draft round holds features of `[0, prefix_len)`.
 Verify commits bonus + accepted tokens. The correction token is the next
 bonus and is **not** folded in yet.
 
-SGLang v0.5.18 files (fork):
+SGLang v0.5.19 files (fork `dflash-linear-v0.5.19`):
 
 | File | Role |
 |---|---|
 | `python/sglang/srt/models/dflash_linear.py` | `DFlashLinearDraftModel`, weight names 1:1 with SpecForge |
 | `python/sglang/srt/speculative/dflash_linear_state.py` | GDN step, masked block commit, FLA varlen wrapper |
 | `python/sglang/srt/speculative/dflash_linear_worker_v2.py` | State pool, ownership, prefill/verify commits, shadow check |
-| `python/sglang/srt/speculative/dflash_worker_v2.py` | Stock worker; commit hooks extracted, appends unchanged |
-| `python/sglang/srt/speculative/spec_info.py` | `create_worker` dispatch |
+| `python/sglang/srt/speculative/dflash_worker_v2.py` | 0.5.19 stock worker (DFlash2 selector / quantized lm_head / TP-sync); linear commit hooks extracted onto this file, never copied from 0.5.18 |
+| `python/sglang/srt/models/dflash.py` | Unmodified 0.5.19 `EntryClass` includes `DFlash2DraftModel`; do not overlay |
+| `python/sglang/srt/speculative/spec_info.py` | `create_worker` dispatch: linear → `DFlashLinearWorkerV2`, else stock `DFlashWorkerV2` |
+| `python/sglang/srt/speculative/dflash_utils.py` | Keep 0.5.19 helpers (`is_dense_head_weight`); re-add `is_dflash_linear_*` |
 | `python/sglang/srt/arg_groups/speculative_hook.py` | Linear refuses draft-window, TP>1, radix |
 
 SpecForge:
@@ -75,9 +79,10 @@ SpecForge:
 | File | Role |
 |---|---|
 | `scripts/eval/dflash_linear_eval.py` | `prepare`, `mal`, `sglang-mal`, `compare-mal`, `feature-contract-check` |
-| [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) | Overlay fork files + spec-capture patch onto `lmsysorg/sglang:v0.5.18-rocm700-mi35x` |
-| [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) | Same base + FLA/tensorboard; tag `naqin/primus-specforge:v0.5.18-train-rocm700-mi35x` |
-| [build-sglang-0.5.18-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.18-image.sh) | Stages the Dockerfile and tags `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` |
+| [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19) | Overlay fork files + v0.5.19 spec-capture patch onto `lmsysorg/sglang:v0.5.19-rocm700-mi35x` |
+| [Dockerfile.sglang-0.5.18](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18) | Previous eval overlay (M1 evidence); leave in place |
+| [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) | 0.5.18 base + FLA/tensorboard; tag `naqin/primus-specforge:v0.5.18-train-rocm700-mi35x` |
+| [build-sglang-0.5.19-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh) | Stages the Dockerfile and tags `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x` |
 | `scripts/cluster/dflash-linear/` | Docker/sbatch launchers, overlay mounts |
 | `scripts/cluster/dflash-linear/archive/` | Pre-SGLang HuggingFace `spec_generate` serve/eval (do not use) |
 | `specforge/modeling/draft/dflash_linear.py` | Training / teacher-force draft |
@@ -114,8 +119,8 @@ near 16 BF16 or 32 FP32 tokens of context.
 - Training `max_length: 2048` makes long-\(L\) eval out of distribution.
 - 10/16 stock-vs-linear completions diverge late on thinking traces. Report
   it; do not treat it as a failed verify path unless the first tokens differ.
-- M1 was one 1-epoch checkpoint. Retrain on 0.5.18 capture only if
-  feature-contract-check fails for a new target or image.
+- M1 was one 1-epoch checkpoint. Retrain or recapture the 40k set only if
+  feature-contract-check fails for a new target or the 0.5.19 image.
 
 ## Future work
 

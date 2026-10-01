@@ -7,7 +7,7 @@ cd /workspace/SpecForge
 echo "=== pip install -e . --no-deps ==="
 pip install -e . --no-deps
 pip install datasets pandas tiktoken requests
-bash /workspace/SpecForge/scripts/apply_sglang_spec_capture_patch.sh --target v0.5.18 || \
+bash /workspace/SpecForge/scripts/apply_sglang_spec_capture_patch.sh --target v0.5.19 || \
   echo "WARN: spec-capture patch not applied"
 
 echo "=== CPU SGLang MAL helper tests ==="

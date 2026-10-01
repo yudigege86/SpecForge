@@ -19,11 +19,46 @@ mkdir -p "${RUN_DIR}"
 python3 - <<PY
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from sglang.srt.models.registry import ModelRegistry
+from sglang.srt.speculative.dflash_linear_worker_v2 import DFlashLinearWorkerV2
+from sglang.srt.speculative.dflash_utils import is_dflash_linear_config, is_dflash_linear_draft
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
 cfg = json.loads((Path("${DRAFT_HF}") / "config.json").read_text())
 arch = (cfg.get("architectures") or [None])[0]
 print("architectures", cfg.get("architectures"))
 if arch != "DFlashLinearDraftModel":
     raise SystemExit(f"expected DFlashLinearDraftModel, got {arch}")
+
+supported = set(ModelRegistry.get_supported_archs())
+print("registry_has_DFlash2DraftModel", "DFlash2DraftModel" in supported)
+print("registry_has_DFlashLinearDraftModel", "DFlashLinearDraftModel" in supported)
+if "DFlash2DraftModel" not in supported:
+    raise SystemExit("DFlash2DraftModel missing from SGLang model registry")
+if "DFlashLinearDraftModel" not in supported:
+    raise SystemExit("DFlashLinearDraftModel missing from SGLang model registry")
+print("is_dflash_linear_config", is_dflash_linear_config(cfg))
+args = SimpleNamespace(
+    speculative_draft_model_path="${DRAFT_HF}",
+    json_model_override_args=None,
+    trust_remote_code=True,
+    speculative_draft_model_revision=None,
+)
+print("is_dflash_linear_draft", is_dflash_linear_draft(args))
+if not is_dflash_linear_draft(args):
+    raise SystemExit("create_worker would not route linear -> DFlashLinearWorkerV2")
+if not issubclass(DFlashLinearWorkerV2, DFlashWorkerV2):
+    raise SystemExit("DFlashLinearWorkerV2 must subclass DFlashWorkerV2")
+try:
+    worker_cls = SpeculativeAlgorithm.DFLASH.create_worker(args)
+    print("create_worker", getattr(worker_cls, "__name__", worker_cls))
+    if worker_cls is not DFlashLinearWorkerV2:
+        raise SystemExit(f"expected DFlashLinearWorkerV2, got {worker_cls}")
+except Exception as exc:
+    print("create_worker_probe", type(exc).__name__, exc)
+print("PASS: DFlash2 + DFlashLinear registry")
 try:
     import torch
     print("cuda_is_available", torch.cuda.is_available())

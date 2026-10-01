@@ -4,7 +4,8 @@
 #SBATCH --partition=amd-spur
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=128G
 #SBATCH --time=02:00:00
 #SBATCH --job-name=dflin-smoke
 #SBATCH --output=/shared_nfs/naqin/Linear-Context-DFlash/mal-eval/sglang-smoke/sbatch-%j.out

@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SPECFORGE_SRC="${SPECFORGE_SRC:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
 
-RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x}"
-IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.18-dflash-linear-rocm700-mi35x.tar.zst}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x}"
+IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/primus-specforge-v0.5.19-dflash-linear-rocm700-mi35x.tar.zst}"
 HF_HOME="${HF_HOME:-/shared_nfs/naqin/hf-cache}"
 HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.5-4B}"

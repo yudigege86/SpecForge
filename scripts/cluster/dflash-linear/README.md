@@ -8,8 +8,9 @@ results still live under `/shared_nfs/naqin/Linear-Context-DFlash/`.
 - [How to run SGLang eval](../../../docs/linear-context-dflash-sglang-eval.md)
 - [Implementation status and future work](../../../docs/linear-context-dflash-sglang-status.md)
 - [Configs: default vs no-ctx-residual vs qkv](../../../docs/linear-context-dflash-variants.md)
-- [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — eval overlay on `lmsysorg/sglang:v0.5.18-rocm700-mi35x`
-- [Dockerfile.sglang-0.5.18-train](./Dockerfile.sglang-0.5.18-train) — same base plus FLA/tensorboard for offline 1-epoch train (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`)
+- [Dockerfile.sglang-0.5.19](./Dockerfile.sglang-0.5.19) — eval overlay on `lmsysorg/sglang:v0.5.19-rocm700-mi35x` (DFlash2 + linear)
+- [Dockerfile.sglang-0.5.18](./Dockerfile.sglang-0.5.18) — previous eval overlay on `lmsysorg/sglang:v0.5.18-rocm700-mi35x`
+- [Dockerfile.sglang-0.5.18-train](./Dockerfile.sglang-0.5.18-train) — 0.5.18 base plus FLA/tensorboard for offline 1-epoch train (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`)
 
 Live card MAL is SGLang `--speculative-algorithm DFLASH` plus
 `scripts/eval/dflash_linear_eval.py` (`sglang-mal`, then `mal --replay-json`
@@ -93,7 +94,7 @@ COMPARE_JSON=/path/to/speedbench_mal.json \
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-speedbench-sglang.sbatch
 ```
 
-0.5.18 image, M0 smoke, feature-contract check, stock rebaseline, linear parity:
+0.5.19 eval image (DFlash2 + linear), M0 smoke, feature-contract check:
 
 ```bash
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch
