@@ -1,5 +1,11 @@
 # Linear-Context DFlash: evaluation status and SGLang plan
 
+Current serving is SGLang **v0.5.19** (`dflash-linear-v0.5.19`). Current
+training is the **0.5.18-train** image. See
+[linear-context-dflash-docker.md](../../../docs/linear-context-dflash-docker.md).
+This file is the M1 campaign record (0.5.18 eval image); do not treat its
+image pins as the live defaults.
+
 This note records what the Qwen3.5-4B evaluation campaign actually measured,
 what is still wrong, and how to put `DFlashLinearDraftModel` into SGLang so
 future trained drafters can be scored the same way as stock DFlash.

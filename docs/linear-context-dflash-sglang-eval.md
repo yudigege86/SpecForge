@@ -13,9 +13,11 @@ mean block accept length, HuggingFace `hidden_states` teacher-force, or
 SPEED-Bench Qualitative `concat_user` as a z-lab card number.
 
 Companion notes: [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md),
-[linear-context-dflash-variants.md](./linear-context-dflash-variants.md).
+[linear-context-dflash-variants.md](./linear-context-dflash-variants.md),
+[which Docker image](./linear-context-dflash-docker.md).
 Cluster launchers: `scripts/cluster/dflash-linear/`.
-Image: [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19).
+Serving image: [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19).
+Train image: [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train).
 Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 [scripts/cluster/dflash-linear/archive/](../scripts/cluster/dflash-linear/archive/).
 
@@ -24,7 +26,7 @@ Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 | Piece | Pin |
 |---|---|
 | SGLang | Fork `yudigege86/sglang` branch `dflash-linear-v0.5.19` off `v0.5.19` (`0bcd822377` + linear cherry-picks, HEAD `2e3695e59`). Keep `dflash-linear` as the validated 0.5.18 history (`2a73ad467`) |
-| Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19) (`FROM lmsysorg/sglang:v0.5.19-rocm700-mi35x`) |
+| Serving Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19) (`FROM lmsysorg/sglang:v0.5.19-rocm700-mi35x`) |
 | Train image | [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`, FLA baked in). Do not rebuild unless the feature-contract gate fails |
 | Image build | [build-sglang-0.5.19-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
 | Image | `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x` (digest `sha256:673690725b3ebcaa12e1b6f27ea90d0609cca84aad548497e9f777a20a1c32a4`) |

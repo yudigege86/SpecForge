@@ -2,6 +2,7 @@
 
 How to run eval: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md).
 Configs (default, no-ctx-residual, qkv): [linear-context-dflash-variants.md](./linear-context-dflash-variants.md).
+Which Docker image: [linear-context-dflash-docker.md](./linear-context-dflash-docker.md).
 Runtime image: [Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19).
 Train image: [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train).
 

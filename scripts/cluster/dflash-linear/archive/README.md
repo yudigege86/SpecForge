@@ -8,12 +8,13 @@ protocol.
 
 Use instead:
 
+- [Which Docker image](../../../../docs/linear-context-dflash-docker.md)
 - [How to run SGLang eval](../../../../docs/linear-context-dflash-sglang-eval.md)
 - `scripts/eval/dflash_linear_eval.py` (`prepare`, `mal`, `sglang-mal`, `compare-mal`)
 - `cluster-dflash-linear-{sglang-smoke,parity,m1-gates,feature-contract,rebaseline}.sbatch`
 
 Kept here so old sbatch logs and NFS paths still make sense. The mal
-launcher also pinned the **0.5.14** image; live eval is 0.5.18.
+launcher also pinned the **0.5.14** image; live eval is 0.5.19.
 
 | File | Was |
 |---|---|

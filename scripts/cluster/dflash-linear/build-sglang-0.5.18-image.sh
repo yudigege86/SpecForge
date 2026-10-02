@@ -1,4 +1,5 @@
 #!/bin/bash
+# Historical M1 eval image. New serving uses build-sglang-0.5.19-image.sh.
 # Build naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x on a compute node.
 set -euo pipefail
 SGLANG_SRC="${SGLANG_SRC:-/shared_nfs/naqin/Linear-Context-DFlash/sglang}"

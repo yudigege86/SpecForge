@@ -1,5 +1,5 @@
 #!/bin/bash
-# 3-step dflash_linear training smoke inside naqin/primus-specforge:v0.5.14-rocm700-mi35x.
+# 3-step dflash_linear training smoke inside naqin/primus-specforge:v0.5.18-train-rocm700-mi35x.
 # backend=auto selects chunked FLA on GPU when the kernel is installed.
 set -euo pipefail
 

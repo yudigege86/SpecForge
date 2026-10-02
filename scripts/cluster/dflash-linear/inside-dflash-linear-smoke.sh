@@ -1,5 +1,5 @@
 #!/bin/bash
-# Runs inside naqin/primus-specforge:v0.5.14-rocm700-mi35x.
+# Runs inside naqin/primus-specforge:v0.5.18-train-rocm700-mi35x.
 # 1-step linear-context GDN smoke, then stock DFlash on the same shard.
 set -euo pipefail
 

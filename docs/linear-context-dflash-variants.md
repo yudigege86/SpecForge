@@ -8,6 +8,7 @@ dflash`, `DFlashDraftModel`) is a different algorithm and is not listed here.
 
 Eval and serving: [linear-context-dflash-sglang-eval.md](./linear-context-dflash-sglang-eval.md),
 [linear-context-dflash-sglang-status.md](./linear-context-dflash-sglang-status.md).
+Docker images: [linear-context-dflash-docker.md](./linear-context-dflash-docker.md).
 Layer code: `specforge/modeling/draft/dflash_linear.py`,
 `specforge/modeling/draft/dflash2_linear.py`.
 

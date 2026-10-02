@@ -1,4 +1,5 @@
-# Overlay linear-context DFLASH onto the published 0.5.18 ROCm image.
+# Historical M1 eval overlay. Do not use for new serving or training.
+# Serving: Dockerfile.sglang-0.5.19. Training: Dockerfile.sglang-0.5.18-train.
 # Do not COPY the whole sglang python tree: the laptop checkout is sparse.
 FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x
 
