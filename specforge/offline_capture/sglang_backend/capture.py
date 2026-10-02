@@ -100,6 +100,21 @@ def _parallel_state_for_offline(server_args, tp_rank: int, gpu_id: int):
     return ParallelState(**overrides)
 
 
+def _call_mlp_flag(fn, server_args):
+    """Call require_mlp_sync / require_mlp_tp_gather across SGLang versions.
+
+    v0.5.18 takes server_args; v0.5.19+ reads published runtime_context and
+    takes no positional arguments.
+    """
+    try:
+        nparams = len(inspect.signature(fn).parameters)
+    except (TypeError, ValueError):
+        nparams = 1
+    if nparams == 0:
+        return bool(fn())
+    return bool(fn(server_args))
+
+
 # SGLang capture hooks tried in order for each capture method. K3-class targets
 # expose a native DSpark hook; dense targets serve the same auxiliary
 # hidden-state layout through the DFlash hook, so DSpark falls back to it.
@@ -216,30 +231,31 @@ class OfflineSGLangCaptureBackend:
         )
 
     def _maybe_prepare_mlp_sync_batch(self, batch: ScheduleBatch) -> None:
-        if require_mlp_sync(self.model_runner.server_args):
-            kwargs = {
-                "dp_size": self.model_runner.server_args.dp_size,
-                "attn_tp_size": 1,
-                "attn_cp_size": getattr(
-                    self.model_runner.server_args, "attn_cp_size", 1
-                ),
-                "tp_group": self.model_runner.tp_group,
-                "get_idle_batch": None,
-                "disable_cuda_graph": self.model_runner.server_args.disable_cuda_graph,
-                "require_mlp_tp_gather": require_mlp_tp_gather(
-                    self.model_runner.server_args
-                ),
-                "disable_overlap_schedule": (
-                    self.model_runner.server_args.disable_overlap_schedule
-                ),
-                "offload_tags": set(),
-                "model_runner": self.model_runner,
-            }
-            try:
-                prepare_mlp_sync_batch_raw(batch, **kwargs)
-            except TypeError:
-                kwargs.pop("model_runner", None)
-                prepare_mlp_sync_batch_raw(batch, **kwargs)
+        if not _call_mlp_flag(require_mlp_sync, self.model_runner.server_args):
+            return
+        kwargs = {
+            "dp_size": self.model_runner.server_args.dp_size,
+            "attn_tp_size": 1,
+            "attn_cp_size": getattr(
+                self.model_runner.server_args, "attn_cp_size", 1
+            ),
+            "tp_group": self.model_runner.tp_group,
+            "get_idle_batch": None,
+            "disable_cuda_graph": self.model_runner.server_args.disable_cuda_graph,
+            "require_mlp_tp_gather": _call_mlp_flag(
+                require_mlp_tp_gather, self.model_runner.server_args
+            ),
+            "disable_overlap_schedule": (
+                self.model_runner.server_args.disable_overlap_schedule
+            ),
+            "offload_tags": set(),
+            "model_runner": self.model_runner,
+        }
+        try:
+            prepare_mlp_sync_batch_raw(batch, **kwargs)
+        except TypeError:
+            kwargs.pop("model_runner", None)
+            prepare_mlp_sync_batch_raw(batch, **kwargs)
 
     @torch.no_grad()
     def _forward_extend(self, reqs: list[Req]):
