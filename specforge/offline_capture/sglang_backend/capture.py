@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 import logging
 from array import array
 from typing import List, Optional
@@ -45,6 +47,58 @@ from .model_runner import SGLangRunner
 from .utils import wrap_offline_eagle3_logits_processors
 
 logger = logging.getLogger(__name__)
+
+
+def _parallel_state_for_offline(server_args, tp_rank: int, gpu_id: int):
+    """Build ``ParallelState`` for the installed SGLang, including 0.5.19 ``trivial()``."""
+
+    attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
+        compute_dp_attention_world_info(
+            server_args.enable_dp_attention,
+            tp_rank,
+            server_args.tp_size,
+            server_args.dp_size,
+            getattr(server_args, "attn_cp_size", 1),
+        )
+    )
+    attn_cp_size = getattr(server_args, "attn_cp_size", 1)
+    attn_tp_size = max(attn_tp_size, 1)
+    attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
+    moe_dp_size = getattr(server_args, "moe_dp_size", 1)
+    moe_dp_rank = tp_rank // (server_args.tp_size // moe_dp_size)
+    moe_ep_rank = (
+        tp_rank
+        % (server_args.tp_size // moe_dp_size)
+        // (server_args.tp_size // moe_dp_size // server_args.ep_size)
+    )
+    overrides = dict(
+        tp_rank=tp_rank,
+        tp_size=server_args.tp_size,
+        pp_rank=0,
+        pp_size=1,
+        dp_rank=0,
+        dp_size=server_args.dp_size,
+        attn_tp_rank=attn_tp_rank,
+        attn_tp_size=attn_tp_size,
+        attn_cp_rank=attn_cp_rank,
+        attn_cp_size=attn_cp_size,
+        attn_dcp_rank=tp_rank % getattr(server_args, "dcp_size", 1),
+        attn_dcp_size=getattr(server_args, "dcp_size", 1),
+        attn_dp_rank=attn_dp_rank,
+        attn_dp_size=attn_dp_size,
+        moe_ep_rank=moe_ep_rank,
+        moe_ep_size=server_args.ep_size,
+        moe_dp_rank=moe_dp_rank,
+        moe_dp_size=moe_dp_size,
+        gpu_id=gpu_id,
+    )
+    if hasattr(ParallelState, "trivial"):
+        valid = {field.name for field in dataclasses.fields(ParallelState)}
+        return ParallelState.trivial(
+            **{key: value for key, value in overrides.items() if key in valid}
+        )
+    return ParallelState(**overrides)
+
 
 # SGLang capture hooks tried in order for each capture method. K3-class targets
 # expose a native DSpark hook; dense targets serve the same auxiliary
@@ -91,60 +145,18 @@ class OfflineSGLangCaptureBackend:
         tp_rank = dist.get_rank(get_tp_group())
         gpu_id = torch.cuda.current_device()
         model_config = ModelConfig.from_server_args(server_args)
-        model_runner = None
-        if ParallelState is not None:
-            try:
-                attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size = (
-                    compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
-                        tp_rank,
-                        server_args.tp_size,
-                        server_args.dp_size,
-                        getattr(server_args, "attn_cp_size", 1),
-                    )
-                )
-                attn_cp_size = getattr(server_args, "attn_cp_size", 1)
-                attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
-                moe_dp_size = getattr(server_args, "moe_dp_size", 1)
-                moe_dp_rank = tp_rank // (server_args.tp_size // moe_dp_size)
-                moe_ep_rank = (
-                    tp_rank
-                    % (server_args.tp_size // moe_dp_size)
-                    // (server_args.tp_size // moe_dp_size // server_args.ep_size)
-                )
-                parallel_state = ParallelState(
-                    tp_rank=tp_rank,
-                    tp_size=server_args.tp_size,
-                    pp_rank=0,
-                    pp_size=1,
-                    dp_rank=0,
-                    dp_size=server_args.dp_size,
-                    attn_tp_rank=attn_tp_rank,
-                    attn_tp_size=attn_tp_size,
-                    attn_cp_rank=attn_cp_rank,
-                    attn_cp_size=attn_cp_size,
-                    attn_dcp_rank=tp_rank % getattr(server_args, "dcp_size", 1),
-                    attn_dcp_size=getattr(server_args, "dcp_size", 1),
-                    attn_dp_rank=attn_dp_rank,
-                    attn_dp_size=attn_dp_size,
-                    moe_ep_rank=moe_ep_rank,
-                    moe_ep_size=server_args.ep_size,
-                    moe_dp_rank=moe_dp_rank,
-                    moe_dp_size=moe_dp_size,
-                    gpu_id=gpu_id,
-                )
-                model_runner = SGLangRunner(
-                    model_config=model_config,
-                    mem_fraction_static=server_args.mem_fraction_static,
-                    gpu_id=gpu_id,
-                    ps=parallel_state,
-                    server_args=server_args,
-                    nccl_port=None,
-                    is_draft_worker=False,
-                )
-            except TypeError:
-                model_runner = None
-        if model_runner is None:
+        runner_params = inspect.signature(SGLangRunner.__init__).parameters
+        if ParallelState is not None and "ps" in runner_params:
+            model_runner = SGLangRunner(
+                model_config=model_config,
+                mem_fraction_static=server_args.mem_fraction_static,
+                gpu_id=gpu_id,
+                ps=_parallel_state_for_offline(server_args, tp_rank, gpu_id),
+                server_args=server_args,
+                nccl_port=None,
+                is_draft_worker=False,
+            )
+        else:
             moe_ep_rank = tp_rank // (server_args.tp_size // server_args.ep_size)
             model_runner = SGLangRunner(
                 model_config=model_config,
