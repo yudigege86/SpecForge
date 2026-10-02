@@ -24,6 +24,7 @@ number: the 1-epoch drafter sits near MAL 2.5 vs stock concat-KV ~7.9.
 | M-1 benchmark contract | Landed | `run_record`, pinned prepare SHAs, strict `compare-mal`, `feature_contract.json`, `feature-contract-check` |
 | M0 load | Landed | Server starts, `/get_server_info` = `DFLASH`, one `/generate` returns `spec_verify_ct` |
 | M1 live vs aux parity | Landed | Job 175655, `mal-eval/m1-gates/20260926T034914Z`, fork `2a73ad467` |
+| 0.5.19 DFlash2 bump | Landed | Image 185227, smoke 185228, feature-contract 185273; fork `2e3695e59` |
 | M2 HE 164 + MT-Bench t1 stock vs linear | Not started | Same live protocol, first publishable relative live MAL |
 | M3 graphs / fused commit / TP / radix | Not started | See below |
 | M4 FLA kernel tolerance on gfx950 | Outlined | Serving FP32 vs training BF16 FLA windows |
@@ -45,6 +46,22 @@ All four scheduler settings agreed:
 Stock rebaseline on the same 0.5.18 image: HE n=16 live **7.879** / aux
 **7.527**; HE n=164 live **8.019** / aux **7.767**. Feature contract vs the
 40k training capture: mean cosine **0.99983** (min 0.99951, gate 0.99).
+
+### 0.5.19 DFlash2 serving bump (2026-10-02)
+
+Eval image `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x`
+digest `sha256:673690725b3ebcaa12e1b6f27ea90d0609cca84aad548497e9f777a20a1c32a4`
+(sglang `2e3695e59`). Train image and 40k capture were not rebuilt.
+
+| Gate | Job | Result |
+|---|---|---|
+| Image build | 185227 | Tag + archive `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.19-dflash-linear-rocm700-mi35x.tar.zst` |
+| Registry + linear generate | 185228 | `DFlash2DraftModel` and `DFlashLinearDraftModel` in registry; linear → `DFlashLinearWorkerV2`; `/generate` `spec_verify_ct=12`; `mal-eval/sglang-smoke/20261002T212803Z` |
+| Feature-contract vs 40k | 185273 | n=16 mean cosine **0.99983**, min **0.99951**, gate 0.99; `mal-eval/feature-contract/20261002T220724Z` |
+
+Offline capture on 0.5.19 needed SpecForge shims (`publish()`,
+`ParallelState.trivial()`, `page_size=1`, no-arg `require_mlp_sync()`).
+The overlay still does not copy `models/dflash.py` or the 0.5.18 worker.
 
 ### What is implemented
 

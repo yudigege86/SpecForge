@@ -23,11 +23,11 @@ Pre-SGLang HuggingFace `spec_generate` serve/eval is archived at
 
 | Piece | Pin |
 |---|---|
-| SGLang | Fork `yudigege86/sglang` branch `dflash-linear-v0.5.19` off `v0.5.19` (`0bcd822377` + linear cherry-picks). Keep `dflash-linear` as the validated 0.5.18 history (`2a73ad467`) |
+| SGLang | Fork `yudigege86/sglang` branch `dflash-linear-v0.5.19` off `v0.5.19` (`0bcd822377` + linear cherry-picks, HEAD `2e3695e59`). Keep `dflash-linear` as the validated 0.5.18 history (`2a73ad467`) |
 | Dockerfile | [scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.19) (`FROM lmsysorg/sglang:v0.5.19-rocm700-mi35x`) |
 | Train image | [Dockerfile.sglang-0.5.18-train](../scripts/cluster/dflash-linear/Dockerfile.sglang-0.5.18-train) (`naqin/primus-specforge:v0.5.18-train-rocm700-mi35x`, FLA baked in). Do not rebuild unless the feature-contract gate fails |
 | Image build | [build-sglang-0.5.19-image.sh](../scripts/cluster/dflash-linear/build-sglang-0.5.19-image.sh), [cluster-dflash-linear-image.sbatch](../scripts/cluster/dflash-linear/cluster-dflash-linear-image.sbatch) |
-| Image | `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x` (digest filled after the burst image build) |
+| Image | `naqin/primus-specforge:v0.5.19-dflash-linear-rocm700-mi35x` (digest `sha256:673690725b3ebcaa12e1b6f27ea90d0609cca84aad548497e9f777a20a1c32a4`) |
 | Archive | `/shared_nfs/naqin/docker-images/primus-specforge-v0.5.19-dflash-linear-rocm700-mi35x.tar.zst` |
 | Previous M1 eval image | `naqin/primus-specforge:v0.5.18-dflash-linear-rocm700-mi35x` (digest `sha256:ce8ff833c63aba22ec9606817926e2f7109c95173f1692fbff7cb4d7429a8a30`) |
 | SpecForge | This branch (`dflash-linear`), eval CLI `scripts/eval/dflash_linear_eval.py`, `sglang==0.5.19` |
@@ -103,6 +103,9 @@ sbatch --account=amd-brain-models --qos=amd-burst-qos --partition=amd-spur \
 
 Pass when `/get_server_info` reports `DFLASH`, the loaded draft is
 `DFlashLinearDraftModel`, and one `/generate` returns `spec_verify_ct`.
+Job 185228 (`mal-eval/sglang-smoke/20261002T212803Z`) also registered
+`DFlash2DraftModel`, routed linear to `DFlashLinearWorkerV2`, and returned
+`spec_verify_ct=12`.
 
 ### Live MAL + aux replay + compare (one scheduler setting)
 
@@ -159,8 +162,10 @@ export FEATURE_CONTRACT_GATE=0.99
 sbatch scripts/cluster/dflash-linear/cluster-dflash-linear-feature-contract.sbatch
 ```
 
-Pass: mean per-token cosine ≥ 0.99 on n=16 samples. The 40k Qwen3.5-4B
-capture on this stack measured mean cosine 0.99983.
+Pass: mean per-token cosine ≥ 0.99 on n=16 samples. Job 185273 on the
+0.5.19 image vs the existing 40k capture: mean cosine **0.99983**, min
+**0.99951** (`mal-eval/feature-contract/20261002T220724Z`). Same cosine
+as the 0.5.18 contract; no recapture.
 
 ### Stock rebaseline (concat-KV DFlash, same image)
 
