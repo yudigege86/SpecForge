@@ -33,6 +33,12 @@ try:
 except ImportError:  # SGLang 0.5.14
     ParallelState = None
 
+try:
+    # SGLang 0.5.19+: ModelRunner.assert_published requires a process-entry publish.
+    from sglang.srt.runtime_context import publish as publish_runtime_config
+except ImportError:  # SGLang 0.5.18 and earlier
+    publish_runtime_config = None
+
 from specforge.distributed import get_tp_group
 
 from .model_runner import SGLangRunner
@@ -79,6 +85,8 @@ class OfflineSGLangCaptureBackend:
             pp_size=1,
             **kwargs,
         )
+        if publish_runtime_config is not None:
+            publish_runtime_config(server_args, role="scheduler")
 
         tp_rank = dist.get_rank(get_tp_group())
         gpu_id = torch.cuda.current_device()
