@@ -127,6 +127,7 @@ class OfflineSGLangCaptureBackend:
     ) -> "OfflineSGLangCaptureBackend":
         kwargs.setdefault("disable_radix_cache", True)
         kwargs.setdefault("max_running_requests", 1)
+        kwargs.setdefault("page_size", 1)
         tp_size = dist.get_world_size(get_tp_group())
         server_args = ServerArgs(
             model_path=pretrained_model_name_or_path,
