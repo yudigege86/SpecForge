@@ -1,0 +1,64 @@
+# Historical M1 eval overlay. Do not use for new serving or training.
+# Serving: Dockerfile.sglang-0.5.19. Training: Dockerfile.sglang-0.5.18-train.
+# Do not COPY the whole sglang python tree: the laptop checkout is sparse.
+FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x
+
+ARG SGLANG_GIT_SHA=unknown
+ENV SGLANG_GIT_SHA=${SGLANG_GIT_SHA}
+
+# Overlay paths are relative to the installed package (python/ prefix stripped).
+COPY overlay/ /tmp/dflash-linear-overlay/
+COPY spec-capture.patch /tmp/spec-capture.patch
+COPY apply_sglang_spec_capture_patch.sh /tmp/apply_sglang_spec_capture_patch.sh
+
+RUN python3 - <<'PY'
+from pathlib import Path
+import importlib.util
+import shutil
+
+import sglang
+
+file = getattr(sglang, "__file__", None)
+if not file:
+    spec = importlib.util.find_spec("sglang.srt") or importlib.util.find_spec("sglang")
+    locs = list(getattr(spec, "submodule_search_locations", None) or [])
+    if spec and spec.origin:
+        file = spec.origin
+    elif locs:
+        file = str(Path(locs[0]) / "__init__.py")
+if not file:
+    raise SystemExit("could not locate installed sglang package")
+pkg = Path(file).resolve().parent
+if pkg.name != "sglang":
+    # sglang.srt -> parent package dir
+    if pkg.name == "srt":
+        pkg = pkg.parent
+overlay = Path("/tmp/dflash-linear-overlay")
+copied = 0
+for src in overlay.rglob("*"):
+    if not src.is_file():
+        continue
+    rel = src.relative_to(overlay)
+    dest = pkg / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    copied += 1
+    print("overlay", dest)
+print("copied", copied, "files onto", pkg)
+if copied == 0:
+    raise SystemExit("overlay directory was empty")
+Path("/tmp/sglang_pkg").write_text(str(pkg), encoding="utf-8")
+Path("/tmp/sglang_parent").write_text(str(pkg.parent), encoding="utf-8")
+PY
+
+RUN chmod +x /tmp/apply_sglang_spec_capture_patch.sh && \
+    SPECFORGE_SGLANG_ROOT="$(cat /tmp/sglang_parent)" \
+    SPECFORGE_SGLANG_VERSION=0.5.18 \
+    SPECFORGE_SPEC_CAPTURE_PATCH=/tmp/spec-capture.patch \
+    bash /tmp/apply_sglang_spec_capture_patch.sh --target v0.5.18 \
+      || echo "WARN: spec-capture patch did not apply cleanly; serving overlay is still in place" && \
+    test -f "$(cat /tmp/sglang_pkg)/srt/models/dflash_linear.py" && \
+    echo "overlay_ok $(cat /tmp/sglang_pkg)/srt/models/dflash_linear.py"
+
+WORKDIR /workspace
+ENV PYTHONPATH=/sgl-workspace/sglang/python

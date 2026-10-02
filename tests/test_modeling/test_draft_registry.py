@@ -20,7 +20,9 @@ from specforge.modeling.auto import AutoDraftModel, AutoDraftModelConfig
 from specforge.modeling.draft import (
     DRAFT_REGISTRY,
     DFlash2DraftModel,
+    DFlash2LinearDraftModel,
     DFlashDraftModel,
+    DFlashLinearDraftModel,
     DominoDraftModel,
     DSparkDraftModel,
     LlamaForCausalLMEagle3,
@@ -71,6 +73,12 @@ TINY_DSPARK = {
     },
 }
 
+TINY_DFLASH_LINEAR = {
+    **TINY_DFLASH,
+    "architectures": ["DFlashLinearDraftModel"],
+    "layer_types": ["full_attention"],
+}
+
 TINY_DFLASH2 = {
     **TINY_DFLASH,
     "architectures": ["DFlash2DraftModel"],
@@ -82,6 +90,29 @@ TINY_DFLASH2 = {
         "selector_rank": 4,
         "selector_top_k": 4,
         "target_layer_ids": [1],
+    },
+}
+
+TINY_DFLASH2_LINEAR = {
+    **TINY_DFLASH,
+    "architectures": ["DFlash2LinearDraftModel"],
+    "layer_types": ["full_attention"],
+    "dflash_config": {
+        "mask_token_id": 0,
+        "target_layer_ids": [1],
+        "conv_group_size": 16,
+        "conv_kernel_size": 2,
+        "selector_rank": 4,
+        "selector_top_k": 4,
+        "linear_context": {
+            "variant": "gdn",
+            "injection": "gated_residual",
+            "num_heads": 2,
+            "key_dim": 16,
+            "value_dim": 16,
+            "normalize_qk": True,
+            "backend": "naive",
+        },
     },
 }
 
@@ -111,11 +142,17 @@ class DraftRegistryTest(unittest.TestCase):
         self.assertIn("LlamaForCausalLMEagle3", available_drafts())
         self.assertIn("DFlashDraftModel", available_drafts())
         self.assertIn("DFlash2DraftModel", available_drafts())
+        self.assertIn("DFlashLinearDraftModel", available_drafts())
+        self.assertIn("DFlash2LinearDraftModel", available_drafts())
         self.assertIn("DominoDraftModel", available_drafts())
         self.assertIn("DSparkDraftModel", available_drafts())
         self.assertIs(resolve_draft("LlamaForCausalLMEagle3"), LlamaForCausalLMEagle3)
         self.assertIs(resolve_draft("DFlashDraftModel"), DFlashDraftModel)
         self.assertIs(resolve_draft("DFlash2DraftModel"), DFlash2DraftModel)
+        self.assertIs(resolve_draft("DFlashLinearDraftModel"), DFlashLinearDraftModel)
+        self.assertIs(
+            resolve_draft("DFlash2LinearDraftModel"), DFlash2LinearDraftModel
+        )
         self.assertIs(resolve_draft("DominoDraftModel"), DominoDraftModel)
         self.assertIs(resolve_draft("DSparkDraftModel"), DSparkDraftModel)
 
@@ -174,6 +211,35 @@ class AutoLoaderRegistryTest(unittest.TestCase):
         self.assertEqual(model.projector_type, "dspark")
         self.assertIsNotNone(model.markov_head)
         self.assertIsNotNone(model.confidence_head)
+
+    def test_from_config_builds_dflash_linear_as_dflash_subclass(self):
+        path = _write(TINY_DFLASH_LINEAR)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoDraftModel.from_config(config)
+        self.assertIsInstance(model, DFlashLinearDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.block_size, 4)
+        from specforge.modeling.draft.dflash_linear import DFlashLinearDecoderLayer
+
+        self.assertIsInstance(model.layers[0], DFlashLinearDecoderLayer)
+
+    def test_from_config_builds_dflash2_linear_as_linear_subclass(self):
+        path = _write(TINY_DFLASH2_LINEAR)
+        self.addCleanup(os.unlink, path)
+        config = AutoDraftModelConfig.from_file(path)
+        model = AutoDraftModel.from_config(config)
+        self.assertIsInstance(model, DFlash2LinearDraftModel)
+        self.assertIsInstance(model, DFlashLinearDraftModel)
+        self.assertIsInstance(model, DFlashDraftModel)
+        self.assertEqual(model.block_size, 4)
+        from specforge.modeling.draft.dflash2_linear import DFlash2LinearDecoderLayer
+
+        layer = model.layers[0]
+        self.assertIsInstance(layer, DFlash2LinearDecoderLayer)
+        self.assertTrue(hasattr(layer, "attention_conv"))
+        self.assertTrue(hasattr(layer, "mlp_conv"))
+        self.assertTrue(hasattr(model, "candidate_selector"))
 
     def test_from_config_builds_dflash2_as_dflash_variant(self):
         path = _write(TINY_DFLASH2)

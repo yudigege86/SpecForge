@@ -3,6 +3,7 @@ import math
 from typing import Callable, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import DynamicCache
 from transformers.cache_utils import Cache
@@ -616,16 +617,93 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int):
     return target_layer_ids
 
 
+def context_feature_offset(target) -> int:
+    """HF ``hidden_states`` index offset for DFLASH aux features.
+
+    Layer ``k`` is ``hidden_states[k + offset]``. SpecForge and dense Qwen3
+    SGLang both use ``offset=1`` (embeddings at index 0). Qwen3.5 hybrid
+    SGLang marks layer ``k`` with no +1, but a frozen-id A/B with
+    ``offset=0`` still undercounted live DFLASH MAL, so the default stays 1.
+    """
+
+    del target
+    return 1
+
+
 def extract_context_feature(
     hidden_states: list[torch.Tensor],
     layer_ids: Optional[list[int]],
+    offset: int = 1,
 ) -> torch.Tensor:
-    offset = 1
+    """Concat target-layer features from a HuggingFace ``hidden_states`` tuple.
+
+    ``offset=1`` is the dense-Qwen3 convention (layer ``k`` at index ``k+1``).
+    Qwen3.5 hybrid SGLang marks layer ``k`` with no +1, but a frozen-id A/B
+    with ``offset=0`` still undercounted live DFLASH; default stays 1.
+    """
+
+    if offset < 0:
+        raise ValueError(f"offset must be >= 0, got {offset}")
+    if not layer_ids:
+        raise ValueError("layer_ids must be a non-empty list")
+    n_hidden = len(hidden_states)
     selected_states = []
     for layer_id in layer_ids:
-        selected_states.append(hidden_states[layer_id + offset])
-    target_hidden = torch.cat(selected_states, dim=-1)
-    return target_hidden
+        index = int(layer_id) + int(offset)
+        if index < 0 or index >= n_hidden:
+            raise IndexError(
+                f"hidden_states[{index}] out of range (n={n_hidden}) for "
+                f"layer_id={layer_id} offset={offset}"
+            )
+        selected_states.append(hidden_states[index])
+    return torch.cat(selected_states, dim=-1)
+
+
+def target_input_embeddings(target: nn.Module) -> nn.Module:
+    """Resolve input embeddings on dense, hybrid, and tied-head targets."""
+
+    getter = getattr(target, "get_input_embeddings", None)
+    if callable(getter):
+        embeddings = getter()
+        if embeddings is not None:
+            return embeddings
+    model = getattr(target, "model", None)
+    if model is not None:
+        if hasattr(model, "embed_tokens"):
+            return model.embed_tokens
+        language_model = getattr(model, "language_model", None)
+        if language_model is not None and hasattr(language_model, "embed_tokens"):
+            return language_model.embed_tokens
+    raise AttributeError("target has no input embeddings")
+
+
+def target_lm_head(target: nn.Module) -> nn.Module:
+    """Resolve the LM head, including Qwen3.5 hybrid `language_model.lm_head`."""
+
+    head = getattr(target, "lm_head", None)
+    if head is not None:
+        return head
+    language_model = getattr(getattr(target, "model", None), "language_model", None)
+    if language_model is not None:
+        head = getattr(language_model, "lm_head", None)
+        if head is not None:
+            return head
+    return target_input_embeddings(target)
+
+
+def project_draft_logits(head: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+    """Project draft hidden states with a Linear or tied Embedding head."""
+
+    weight = getattr(head, "weight", None)
+    if (
+        weight is not None
+        and hidden.shape[-1] == weight.shape[-1]
+        and not isinstance(head, nn.Embedding)
+    ):
+        return head(hidden)
+    if weight is not None:
+        return F.linear(hidden, weight)
+    return head(hidden)
 
 
 def normalize_draft_head_checkpoint_keys(
@@ -782,8 +860,142 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
         duplicating the target-cache and acceptance logic in ``spec_generate``.
         """
         del block_output_ids
-        draft_logits = target.lm_head(draft_hidden[:, -self.block_size + 1 :, :])
+        draft_logits = project_draft_logits(
+            target_lm_head(target), draft_hidden[:, -self.block_size + 1 :, :]
+        )
         return sample(draft_logits)
+
+    def _teacher_force_block(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        noise_embedding: torch.Tensor,
+        position_ids: torch.Tensor,
+        start: int,
+    ) -> torch.Tensor:
+        """One B-token draft forward on a frozen prefix feature.
+
+        Concat-KV DFlash rotates K over context-then-block, so RoPE
+        positions must be ``0 .. start+block-1``. Queries still take the
+        trailing block slice inside ``apply_rotary_pos_emb``. Linear
+        overrides this hook and keeps block-only ``position_ids``.
+        """
+
+        del position_ids
+        block_size = int(noise_embedding.shape[1])
+        full_position_ids = torch.arange(
+            start + block_size, device=noise_embedding.device
+        ).unsqueeze(0)
+        return self(
+            target_hidden=target_hidden,
+            noise_embedding=noise_embedding,
+            position_ids=full_position_ids,
+            use_cache=False,
+            is_causal=False,
+        )
+
+    @torch.inference_mode()
+    def acceptance_along_sequence(
+        self,
+        target: nn.Module,
+        sequence_ids: torch.LongTensor,
+        prompt_len: int,
+        temperature: float = 0.0,
+        feature_offset: Optional[int] = None,
+        target_hidden: Optional[torch.Tensor] = None,
+    ) -> list[int]:
+        """Teacher-forced block MAL on a frozen target trajectory.
+
+        Avoids incremental target KV cache: one full ``use_cache=False``
+        forward supplies prefix features, then each draft block is scored
+        against the remaining greedy tokens. Training-style noise embeds
+        only the current token; the rest of the block is the mask token.
+        Pass ``target_hidden`` to reuse captured SGLang aux features instead
+        of HuggingFace ``output.hidden_states``.
+        """
+        del temperature
+        self.eval()
+        if self.mask_token_id is None:
+            raise ValueError("DFlash config must define dflash_config.mask_token_id")
+        if sequence_ids.ndim != 2 or sequence_ids.shape[0] != 1:
+            raise ValueError(
+                "acceptance_along_sequence expects sequence_ids of shape [1, L], "
+                f"got {tuple(sequence_ids.shape)}"
+            )
+        seq_len = int(sequence_ids.shape[1])
+        if prompt_len < 1 or prompt_len > seq_len:
+            raise ValueError(
+                f"prompt_len={prompt_len} is outside sequence length {seq_len}"
+            )
+        if target_hidden is None:
+            output = target(
+                input_ids=sequence_ids,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+            if feature_offset is None:
+                feature_offset = context_feature_offset(target)
+            hidden = extract_context_feature(
+                output.hidden_states, self.target_layer_ids, offset=feature_offset
+            )
+        else:
+            hidden = target_hidden
+            if hidden.ndim == 2:
+                hidden = hidden.unsqueeze(0)
+            if hidden.ndim != 3 or hidden.shape[0] != 1:
+                raise ValueError(
+                    "target_hidden must have shape [1, L, H], "
+                    f"got {tuple(hidden.shape)}"
+                )
+            if hidden.device != sequence_ids.device or hidden.dtype != next(
+                self.parameters()
+            ).dtype:
+                hidden = hidden.to(
+                    device=sequence_ids.device, dtype=next(self.parameters()).dtype
+                )
+        if hidden.shape[1] != seq_len:
+            raise ValueError(
+                "target hidden length does not match sequence: "
+                f"{tuple(hidden.shape)} vs L={seq_len}"
+            )
+        embed_tokens = target_input_embeddings(target)
+        device = sequence_ids.device
+        block_size = self.block_size
+        position_ids = torch.arange(seq_len + block_size, device=device).unsqueeze(0)
+        acceptance_lengths: list[int] = []
+        start = prompt_len
+        while start < seq_len:
+            remaining = seq_len - start
+            block_ids = torch.full(
+                (1, block_size),
+                self.mask_token_id,
+                dtype=sequence_ids.dtype,
+                device=device,
+            )
+            block_ids[:, 0] = sequence_ids[:, start]
+            n_draft = min(block_size - 1, remaining - 1)
+            if n_draft <= 0:
+                acceptance_lengths.append(1)
+                start += 1
+                continue
+            draft_hidden = self._teacher_force_block(
+                target_hidden=hidden[:, :start, :],
+                noise_embedding=embed_tokens(block_ids),
+                position_ids=position_ids[:, start : start + block_size],
+                start=start,
+            )
+            drafted = self._sample_draft_tokens(target, draft_hidden, block_ids)
+            target_suffix = sequence_ids[:, start + 1 : start + 1 + n_draft]
+            acceptance_length = int(
+                (drafted[:, :n_draft] == target_suffix)
+                .cumprod(dim=1)
+                .sum(dim=1)[0]
+                .item()
+            )
+            acceptance_lengths.append(acceptance_length + 1)
+            start += acceptance_length + 1
+        self.last_acceptance_lengths = acceptance_lengths
+        return acceptance_lengths
 
     def forward(
         self,
@@ -858,7 +1070,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             output.logits, temperature
         )
         target_hidden = extract_context_feature(
-            output.hidden_states, self.target_layer_ids
+            output.hidden_states,
+            self.target_layer_ids,
+            offset=context_feature_offset(target),
         )
 
         # Decode stage
@@ -909,7 +1123,9 @@ class DFlashDraftModel(Qwen3PreTrainedModel):
             start += acceptance_length + 1
             past_key_values_target.crop(start)
             target_hidden = extract_context_feature(
-                output.hidden_states, self.target_layer_ids
+                output.hidden_states,
+                self.target_layer_ids,
+                offset=context_feature_offset(target),
             )[:, : acceptance_length + 1, :]
             acceptance_lengths.append(acceptance_length + 1)
             if stop_token_ids is not None and any(

@@ -94,11 +94,11 @@ def validate_row(
             raise ValueError(
                 f"assistant message {index} has non-empty reasoning_content"
             )
-        if expect_reasoning and (
-            not isinstance(reasoning, str) or not reasoning.strip()
-        ):
-            raise ValueError(f"assistant message {index} has empty reasoning_content")
-        if strict_think_markers and has_think_marker(content):
+        if expect_reasoning and not isinstance(reasoning, str):
+            raise ValueError(
+                f"assistant message {index} is missing reasoning_content"
+            )
+        if strict_think_markers and isinstance(content, str) and has_think_marker(content):
             raise ValueError(f"assistant message {index} contains a thinking marker")
         if (
             strict_think_markers

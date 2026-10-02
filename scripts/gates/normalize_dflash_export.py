@@ -15,6 +15,11 @@ _DSPARK_TOP_LEVEL_FIELDS = (
     "confidence_head_with_markov",
 )
 _DFLASH2_ARCHITECTURE = "DFlash2DraftModel"
+_DFLASH_LINEAR_ARCHITECTURE = "DFlashLinearDraftModel"
+_DFLASH2_LINEAR_ARCHITECTURE = "DFlash2LinearDraftModel"
+_LINEAR_FAMILY_ARCHITECTURES = frozenset(
+    {_DFLASH_LINEAR_ARCHITECTURE, _DFLASH2_LINEAR_ARCHITECTURE}
+)
 _DFLASH2_FIELDS = (
     "conv_group_size",
     "conv_kernel_size",
@@ -27,14 +32,43 @@ def _positive_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
+def _require_dflash2_fields(method_config: Dict[str, Any], *, label: str) -> None:
     for key in _DFLASH2_FIELDS:
         value = method_config.get(key)
         if not _positive_integer(value):
             raise ValueError(
-                f"DFlash2 export requires a positive integer dflash_config.{key}, "
+                f"{label} export requires a positive integer dflash_config.{key}, "
                 f"got {value!r}"
             )
+
+
+def _require_linear_context(method_config: Dict[str, Any], *, label: str) -> None:
+    linear = method_config.get("linear_context")
+    if not isinstance(linear, dict) or not linear:
+        raise ValueError(
+            f"{label} export requires a non-empty dflash_config.linear_context"
+        )
+
+
+def _normalize_dflash_linear(
+    config: Dict[str, Any], method_config: Dict[str, Any]
+) -> None:
+    """Keep the linear draft class; SGLang's stock DFLASH loader cannot serve it."""
+
+    _require_linear_context(method_config, label="DFlashLinear")
+    config["architectures"] = [_DFLASH_LINEAR_ARCHITECTURE]
+
+
+def _normalize_dflash2_linear(
+    config: Dict[str, Any], method_config: Dict[str, Any]
+) -> None:
+    _require_linear_context(method_config, label="DFlash2Linear")
+    _require_dflash2_fields(method_config, label="DFlash2Linear")
+    config["architectures"] = [_DFLASH2_LINEAR_ARCHITECTURE]
+
+
+def _normalize_dflash2(config: Dict[str, Any], method_config: Dict[str, Any]) -> None:
+    _require_dflash2_fields(method_config, label="DFlash2")
     config["architectures"] = [_DFLASH2_ARCHITECTURE]
 
 
@@ -126,16 +160,47 @@ def normalize_export(config_path: str, expected_block_size: int) -> Dict[str, An
             f"got dflash_config.attention_mode={attention_mode!r}"
         )
 
-    if projector_type == "dspark":
+    keep_auto_map = False
+    architectures = config.get("architectures") or []
+    if _DFLASH2_LINEAR_ARCHITECTURE in architectures:
+        _normalize_dflash2_linear(config, method_config)
+        keep_auto_map = True
+    elif _DFLASH_LINEAR_ARCHITECTURE in architectures:
+        _normalize_dflash_linear(config, method_config)
+        keep_auto_map = True
+    elif projector_type == "dspark":
         _normalize_dspark(config, method_config)
-    elif _DFLASH2_ARCHITECTURE in (config.get("architectures") or []):
+    elif _DFLASH2_ARCHITECTURE in architectures:
         _normalize_dflash2(config, method_config)
     else:
         config["architectures"] = ["DFlashDraftModel"]
-    config.pop("auto_map", None)
+    if not keep_auto_map:
+        config.pop("auto_map", None)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config, handle, indent=2)
         handle.write("\n")
+    if any(
+        name in (config.get("architectures") or [])
+        for name in _LINEAR_FAMILY_ARCHITECTURES
+    ):
+        contract_path = path.parent / "feature_contract.json"
+        contract = {
+            "capture_implementation": "sglang_dflash_aux",
+            "target_layer_ids": list(method_config.get("target_layer_ids") or []),
+            "layer_index_convention": (
+                "embeddings_at_0; dense_qwen3_sglang_marks_k_plus_1; "
+                "qwen3.5_hybrid_marks_k; specforge_offset_default_1"
+            ),
+            "location": "post_layer",
+            "norm": "fc_then_rmsnorm",
+            "dtype": config.get("dtype") or config.get("torch_dtype"),
+            "fusion": "concat_then_fc_rmsnorm",
+            "architectures": list(config.get("architectures") or []),
+            "block_size": config.get("block_size"),
+            "linear_context": method_config.get("linear_context"),
+            "mask_token_id": method_config.get("mask_token_id"),
+        }
+        contract_path.write_text(json.dumps(contract, indent=2) + "\n", encoding="utf-8")
     return config
 
 

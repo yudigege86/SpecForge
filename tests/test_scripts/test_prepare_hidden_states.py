@@ -107,6 +107,11 @@ class PrepareHiddenStatesCaptureLayersTest(unittest.TestCase):
                     "target_last_hidden_states",
                 },
             ),
+            "dflash_linear": (
+                "qwen3.5-4b-dflash-linear.json",
+                (1, 8, 15, 22, 29),
+                {"input_ids", "loss_mask", "hidden_states"},
+            ),
         }
         target_config = SimpleNamespace(num_hidden_layers=40)
 

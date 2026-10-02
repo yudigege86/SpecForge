@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from specforge.algorithms.dflash.providers import create_registration as dflash
+from specforge.algorithms.dflash_linear.providers import (
+    create_registration as dflash_linear,
+)
 from specforge.algorithms.domino.providers import create_registration as domino
 from specforge.algorithms.dspark.providers import create_registration as dspark
 from specforge.algorithms.eagle3.providers import create_registration as eagle3
@@ -14,7 +17,9 @@ from specforge.algorithms.registry import AlgorithmRegistry
 def builtin_algorithm_registry() -> AlgorithmRegistry:
     """Return a fresh immutable catalog without module-level mutation."""
 
-    return AlgorithmRegistry((eagle3(), peagle(), dflash(), domino(), dspark(), mtp()))
+    return AlgorithmRegistry(
+        (eagle3(), peagle(), dflash(), dflash_linear(), domino(), dspark(), mtp())
+    )
 
 
 __all__ = ["builtin_algorithm_registry"]

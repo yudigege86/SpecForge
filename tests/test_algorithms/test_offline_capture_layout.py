@@ -28,6 +28,11 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 "loss_mask": "loss_mask",
                 "hidden_states": "aux_hidden_states",
             },
+            "dflash_linear": {
+                "input_ids": "input_ids",
+                "loss_mask": "loss_mask",
+                "hidden_states": "aux_hidden_states",
+            },
             "domino": {
                 "input_ids": "input_ids",
                 "loss_mask": "loss_mask",
@@ -43,6 +48,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
         expected_capture_methods = {
             "eagle3": "eagle3",
             "dflash": "dflash",
+            "dflash_linear": "dflash",
             "domino": "dflash",
             "dspark": "dspark",
         }
@@ -82,7 +88,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
                 )
 
     def test_materialize_preserves_arbitrary_auxiliary_layer_counts(self):
-        for strategy in ("dflash", "domino", "dspark"):
+        for strategy in ("dflash", "dflash_linear", "domino", "dspark"):
             layout = (
                 self.registry.resolve(strategy)
                 .providers.offline_for("text")
@@ -111,7 +117,7 @@ class OfflineCaptureLayoutTest(unittest.TestCase):
             "hidden_states": torch.randn(1, 3, 8),
             "target_last_hidden_states": torch.randn(1, 3, 8),
         }
-        for strategy in ("dflash", "domino", "dspark"):
+        for strategy in ("dflash", "dflash_linear", "domino", "dspark"):
             with self.subTest(strategy=strategy):
                 normalizer = (
                     self.registry.resolve(strategy)

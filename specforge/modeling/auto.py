@@ -9,9 +9,16 @@ from transformers import PretrainedConfig, modeling_utils
 from .draft.registry import DRAFT_REGISTRY, available_drafts
 
 
+def _ensure_drafts_registered() -> None:
+    # Importing the package registers every built-in architecture, including
+    # DFlash2LinearDraftModel, before AutoDraftModel consults the registry.
+    import specforge.modeling.draft  # noqa: F401
+
+
 class AutoDraftModel(AutoModelForCausalLMBase):
     @classmethod
     def _model_cls_from_config(cls, config: PretrainedConfig):
+        _ensure_drafts_registered()
         archs = getattr(config, "architectures", None) or []
         if len(archs) != 1 or archs[0] not in DRAFT_REGISTRY:
             raise ValueError(
@@ -101,6 +108,7 @@ class AutoDraftModelConfig:
             raise ValueError("Only one architecture is supported")
 
         architecture = architectures[0]
+        _ensure_drafts_registered()
 
         if architecture not in DRAFT_REGISTRY:
             raise ValueError(

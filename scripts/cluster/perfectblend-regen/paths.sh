@@ -1,0 +1,20 @@
+# Shared paths for PerfectBlend Qwen3.5-4B regeneration on SPUR.
+# Sourced by the other scripts in this directory.
+
+ROOT="${ROOT:-/shared_nfs/naqin/Linear-Context-DFlash/perfectblend-qwen35-4b}"
+SPECFORGE_SRC="${SPECFORGE_SRC:-/shared_nfs/naqin/Linear-Context-DFlash/SpecForge}"
+SCRIPT_DIR="${SCRIPT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+PROMPTS_DIR="${PROMPTS_DIR:-${ROOT}/prompts}"
+REGEN_DIR="${REGEN_DIR:-${ROOT}/regen}"
+LOG_ROOT="${LOG_ROOT:-${ROOT}/logs}"
+HF_HOME="${HF_HOME:-/shared_nfs/naqin/hf-cache}"
+HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
+HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-lmsysorg/sglang:v0.5.18-rocm720-mi35x}"
+IMAGE_ARCHIVE="${IMAGE_ARCHIVE:-/shared_nfs/naqin/docker-images/sglang-v0.5.18-rocm720-mi35x.tar.zst}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-4B}"
+NUM_SHARDS="${NUM_SHARDS:-64}"
+SMOKE_ROWS="${SMOKE_ROWS:-32}"
+CONCURRENCY="${CONCURRENCY:-32}"
+MAX_LENGTH="${MAX_LENGTH:-4096}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"

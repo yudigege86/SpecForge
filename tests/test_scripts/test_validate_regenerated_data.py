@@ -9,9 +9,14 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
-from scripts.regenerate_train_data import call_sglang
+from scripts.regenerate_train_data import (
+    build_query_kwargs,
+    call_sglang,
+    drop_truncated_trailing_line,
+    set_skipped,
+    validate_regen_input,
+)
 from scripts.regenerate_train_data import main as regenerate_main
-from scripts.regenerate_train_data import set_skipped, validate_regen_input
 from scripts.validate_regenerated_data import validate_dataset, validate_row
 
 
@@ -74,13 +79,24 @@ class TestValidateRegeneratedData(TestCase):
     def test_reasoning_mode_requires_reasoning_content(self):
         row = make_row()
 
-        with self.assertRaisesRegex(ValueError, "empty reasoning_content"):
+        with self.assertRaisesRegex(ValueError, "missing reasoning_content"):
             validate_row(
                 row,
                 expect_non_reasoning=False,
                 expect_reasoning=True,
                 strict_think_markers=True,
             )
+
+        row["conversations"][-1]["reasoning_content"] = ""
+        self.assertEqual(
+            validate_row(
+                row,
+                expect_non_reasoning=False,
+                expect_reasoning=True,
+                strict_think_markers=True,
+            ),
+            1,
+        )
 
         row["conversations"][-1]["reasoning_content"] = "structured reasoning"
         self.assertEqual(
@@ -344,6 +360,298 @@ class TestRegenerationGuards(TestCase):
             self.assertEqual(submitted, 2)
             self.assertEqual(len(output_path.read_text().splitlines()), 2)
             self.assertEqual(len(skipped_path.read_text().splitlines()), 1)
+
+    def test_qwen_thinking_sampling_goes_to_openai_and_extra_body(self):
+        args = SimpleNamespace(
+            model="Qwen/Qwen3.5-4B",
+            max_tokens=128,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            sglang_repetition_penalty=1.0,
+            repetition_penalty=None,
+            reasoning="save",
+            is_gpt_oss=False,
+        )
+        kwargs = build_query_kwargs(
+            args, [{"role": "user", "content": "question"}]
+        )
+        self.assertEqual(kwargs["temperature"], 1.0)
+        self.assertEqual(kwargs["top_p"], 0.95)
+        self.assertEqual(kwargs["presence_penalty"], 1.5)
+        self.assertEqual(kwargs["extra_body"]["top_k"], 20)
+        self.assertEqual(kwargs["extra_body"]["min_p"], 0.0)
+        self.assertEqual(kwargs["extra_body"]["repetition_penalty"], 1.0)
+        self.assertTrue(
+            kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"]
+        )
+
+    def test_legacy_repetition_penalty_still_maps_to_presence_penalty(self):
+        args = SimpleNamespace(
+            model="Qwen/Qwen3-8B",
+            max_tokens=32,
+            temperature=0.8,
+            top_p=None,
+            top_k=None,
+            repetition_penalty=0.3,
+            reasoning="none",
+            is_gpt_oss=False,
+        )
+        kwargs = build_query_kwargs(
+            args, [{"role": "user", "content": "question"}]
+        )
+        self.assertEqual(kwargs["presence_penalty"], 0.3)
+        self.assertNotIn("extra_body", kwargs)
+
+    def test_max_length_skips_oversized_first_prompt(self):
+        args = SimpleNamespace(
+            model="Qwen/Qwen3.5-4B",
+            max_tokens=4096,
+            max_length=4096,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            sglang_repetition_penalty=1.0,
+            repetition_penalty=None,
+            reasoning="save",
+            is_gpt_oss=False,
+            prompt_token_counter=lambda messages: 4090,
+        )
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            raise AssertionError("oversized prompt should not call the server")
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        with patch("scripts.regenerate_train_data.OpenAI", return_value=client):
+            result = call_sglang(
+                args,
+                "localhost:30000",
+                {
+                    "id": "too-long",
+                    "conversations": [{"role": "user", "content": "long"}],
+                },
+            )
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("max_length", result["error"])
+        self.assertEqual(calls, [])
+
+    def test_max_length_keeps_prefix_when_later_turn_does_not_fit(self):
+        args = SimpleNamespace(
+            model="Qwen/Qwen3.5-4B",
+            max_tokens=4096,
+            max_length=4096,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            sglang_repetition_penalty=1.0,
+            repetition_penalty=None,
+            reasoning="save",
+            is_gpt_oss=False,
+            prompt_token_counter=lambda messages: (
+                100 if len(messages) <= 1 else 4090
+            ),
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="first answer",
+                        reasoning_content="first reasoning",
+                    )
+                )
+            ]
+        )
+        calls = []
+
+        def create(**kwargs):
+            calls.append(kwargs)
+            return response
+
+        client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        )
+        data = {
+            "id": "multi",
+            "conversations": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "old"},
+                {"role": "user", "content": "second"},
+            ],
+        }
+        with patch("scripts.regenerate_train_data.OpenAI", return_value=client):
+            result = call_sglang(args, "localhost:30000", data)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["max_tokens"], 4096 - 100 - 8)
+        self.assertEqual(
+            [message["role"] for message in result["conversations"]],
+            ["user", "assistant"],
+        )
+        self.assertEqual(result["conversations"][-1]["content"], "first answer")
+
+    def test_max_length_keeps_truncated_empty_reasoning(self):
+        args = SimpleNamespace(
+            model="Qwen/Qwen3.5-4B",
+            max_tokens=4096,
+            max_length=4096,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=20,
+            min_p=0.0,
+            presence_penalty=1.5,
+            sglang_repetition_penalty=1.0,
+            repetition_penalty=None,
+            reasoning="save",
+            is_gpt_oss=False,
+            prompt_token_counter=lambda messages: 100,
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="length",
+                    message=SimpleNamespace(
+                        content="",
+                        reasoning_content=None,
+                    ),
+                )
+            ]
+        )
+        client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: response)
+            )
+        )
+        with patch("scripts.regenerate_train_data.OpenAI", return_value=client):
+            result = call_sglang(
+                args,
+                "localhost:30000",
+                {
+                    "id": "truncated",
+                    "conversations": [{"role": "user", "content": "question"}],
+                },
+            )
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["conversations"][-1]["content"], "")
+        self.assertEqual(result["conversations"][-1]["reasoning_content"], "")
+
+    def test_resume_by_id_skips_existing_and_drops_truncated_line(self):
+        with TemporaryDirectory() as tmpdir:
+            input_path = Path(tmpdir) / "input.jsonl"
+            output_path = Path(tmpdir) / "output.jsonl"
+            error_path = Path(tmpdir) / "output_error.jsonl"
+            rows = [
+                {
+                    "id": str(index),
+                    "conversations": [
+                        {"role": "user", "content": f"question {index}"}
+                    ],
+                }
+                for index in range(4)
+            ]
+            input_path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            success = {
+                **rows[0],
+                "status": "success",
+                "conversations": [
+                    *rows[0]["conversations"],
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+            output_path.write_text(
+                json.dumps(success) + "\n" + '{"id": "truncated"',
+                encoding="utf-8",
+            )
+            drop_truncated_trailing_line(str(output_path))
+            self.assertEqual(
+                [json.loads(line)["id"] for line in output_path.read_text().splitlines()],
+                ["0"],
+            )
+            error_path.write_text(
+                json.dumps({"id": "1", "status": "error", "error": "boom"}) + "\n",
+                encoding="utf-8",
+            )
+            submitted_ids = []
+
+            def fake_call(args, server_address, data, max_tokens=None):
+                if max_tokens is not None:
+                    return {"status": "success", "conversations": []}
+                submitted_ids.append(data["id"])
+                return {
+                    **data,
+                    "status": "success",
+                    "conversations": [
+                        *data["conversations"],
+                        {"role": "assistant", "content": "answer"},
+                    ],
+                }
+
+            argv = [
+                "regenerate_train_data.py",
+                "--model",
+                "Qwen/Qwen3.5-4B",
+                "--server-address",
+                "localhost:30000",
+                "--input-file-path",
+                str(input_path),
+                "--output-file-path",
+                str(output_path),
+                "--resume-by-id",
+                "--concurrency",
+                "4",
+            ]
+            with (
+                patch("sys.argv", argv),
+                patch("scripts.regenerate_train_data.call_sglang", fake_call),
+            ):
+                regenerate_main()
+
+            self.assertEqual(submitted_ids, ["1", "2", "3"])
+            success_ids = [
+                json.loads(line)["id"]
+                for line in output_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(success_ids, ["0", "1", "2", "3"])
+
+    def test_write_jsonl_is_thread_safe(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from scripts.regenerate_train_data import write_jsonl
+
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "out.jsonl"
+            with path.open("w", encoding="utf-8") as handle:
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    futs = [
+                        pool.submit(
+                            write_jsonl,
+                            handle,
+                            {"id": str(i), "status": "success"},
+                        )
+                        for i in range(200)
+                    ]
+                    for fut in futs:
+                        fut.result()
+            rows = [
+                json.loads(line)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(rows), 200)
+            self.assertEqual({row["id"] for row in rows}, {str(i) for i in range(200)})
 
 
 class TestQwenRegenerationRecipe(TestCase):

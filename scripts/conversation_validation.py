@@ -27,7 +27,17 @@ def validate_conversation(
             return f"message {index} must be an object"
         role = message.get("role")
         content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
+        # User/system text must be non-empty. Assistant content may be empty when
+        # generation hits the token budget while still thinking.
+        if role == "assistant":
+            if not isinstance(content, str):
+                if error_style == "regeneration":
+                    return (
+                        f"Invalid message content at position {index}: "
+                        "expected a string"
+                    )
+                return f"message {index} content must be a string"
+        elif not isinstance(content, str) or not content.strip():
             if error_style == "regeneration":
                 return (
                     f"Invalid message content at position {index}: "

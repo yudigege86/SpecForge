@@ -13,12 +13,12 @@
 # replaces package-owned files but leaves our added sink and patch record.
 #
 # Usage: scripts/apply_sglang_spec_capture_patch.sh
-#          [--target v0.5.18|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
+#          [--target v0.5.19|v0.5.18|kimi-k3-ee560a2|kimi-k3-9acd9cb|kimi-k3-f8493a4]
 #          [--reverse]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-TARGET="v0.5.18"
+TARGET="v0.5.19"
 PATCH_TARGET=""
 REVERSE=0
 while [[ $# -gt 0 ]]; do
@@ -43,6 +43,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$TARGET" in
+    v0.5.19)
+        EXPECTED_VERSION_PREFIX="0.5.19"
+        PATCH_TARGET="$TARGET"
+        ;;
     v0.5.18)
         EXPECTED_VERSION_PREFIX="0.5.18"
         PATCH_TARGET="$TARGET"
@@ -64,6 +68,12 @@ case "$TARGET" in
         ;;
 esac
 PATCH="${SPECFORGE_SPEC_CAPTURE_PATCH:-$HERE/patches/sglang/$PATCH_TARGET/spec-capture.patch}"
+# Windows-synced checkouts store the patch with CRLF; git apply then fails every hunk.
+if grep -q $'\r' "$PATCH" 2>/dev/null; then
+    PATCH_LF="$(mktemp)"
+    tr -d '\r' < "$PATCH" > "$PATCH_LF"
+    PATCH="$PATCH_LF"
+fi
 
 SGL_PARENT="${SPECFORGE_SGLANG_ROOT:-$(python -c 'import sglang, os; print(os.path.dirname(os.path.dirname(sglang.__file__)))')}"
 SGL_VERSION="${SPECFORGE_SGLANG_VERSION:-$(python -c 'import sglang; print(sglang.__version__)')}"

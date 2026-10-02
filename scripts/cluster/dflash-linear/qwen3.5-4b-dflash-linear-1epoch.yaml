@@ -1,0 +1,40 @@
+# 1-epoch offline train of linear-context DFlash on the full Qwen3.5-4B 40k capture.
+model:
+  target_model_path: "Qwen/Qwen3.5-4B"
+  draft_model_config: "configs/qwen3.5-4b-dflash-linear.json"
+  target_backend: "sglang"
+  trust_remote_code: true
+  embedding_key: "model.language_model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  use_liger_kernel: false
+data:
+  hidden_states_path: "/shared_nfs/naqin/primus-specforge-smoke/qwen-capture-40k/valid-links"
+  max_length: 2048
+  chat_template: "qwen3.5"
+  cache_dir: "/shared_nfs/naqin/Linear-Context-DFlash/train-1epoch/sf-cache"
+training:
+  strategy: "dflash_linear"
+  num_epochs: 1
+  max_steps: 627
+  batch_size: 2
+  accumulation_steps: 4
+  learning_rate: 6.0e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1
+  attention_backend: "sdpa"
+  num_anchors: 512
+  loss_decay_gamma: 7
+  save_interval: 100
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3.5-4b-dflash-linear-1epoch"
+output_dir: "/shared_nfs/naqin/Linear-Context-DFlash/train-1epoch/train"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

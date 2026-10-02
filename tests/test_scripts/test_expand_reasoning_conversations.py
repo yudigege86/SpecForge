@@ -199,7 +199,7 @@ class TestExpandGenerationEvents(unittest.TestCase):
                 self.assertIn("expected non-empty string", reason)
 
     def test_validate_rejects_missing_or_invalid_reasoning(self):
-        for reasoning in (None, "", []):
+        for reasoning in (None, []):
             with self.subTest(reasoning=reasoning):
                 reason = validate_conversation(
                     [
@@ -213,7 +213,20 @@ class TestExpandGenerationEvents(unittest.TestCase):
                 )
 
                 self.assertIn("assistant reasoning_content", reason)
-                self.assertIn("expected non-empty string", reason)
+                self.assertIn("expected a string", reason)
+
+    def test_validate_allows_empty_reasoning_string(self):
+        reason = validate_conversation(
+            [
+                {"role": "user", "content": "question"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "",
+                },
+            ]
+        )
+        self.assertIsNone(reason)
 
     def test_main_writes_events_and_skipped_rows(self):
         with TemporaryDirectory() as tmpdir:

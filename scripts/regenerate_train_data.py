@@ -6,27 +6,35 @@ Usage:
 1. Set up one or more SGLang servers for the target model.
 
 python3 -m sglang.launch_server \
-	--model Qwen/Qwen3.5-35B-A3B \
-	--mem-fraction-static 0.7 \
+	--model Qwen/Qwen3.5-4B \
+	--mem-fraction-static 0.8 \
 	--tp 1 \
 	--trust-remote-code \
-    --cuda-graph-max-bs 128 \
+    --cuda-graph-max-bs 32 \
 	--host 0.0.0.0 \
 	--port 30000 \
 	--dtype bfloat16 \
-    --reasoning-parser qwen3
+    --reasoning-parser qwen3 \
+    --attention-backend aiter \
+    --disable-radix-cache \
+    --context-length 4096
 
 
 2. Regenerate the dataset using the `regenerate_train_data.py` script.
 python scripts/regenerate_train_data.py \
-    --model Qwen/Qwen3.5-35B-A3B \
-    --concurrency 128 \
-    --max-tokens 4096 \
+    --model Qwen/Qwen3.5-4B \
+    --concurrency 32 \
+    --max-length 4096 \
     --server-address localhost:30000 localhost:30010 localhost:30020 localhost:30030 localhost:30040 localhost:30050 localhost:30060 localhost:30070 \
-    --temperature 0.8 \
-    --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
-    --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
-    --resume \
+    --temperature 1.0 \
+    --top-p 0.95 \
+    --top-k 20 \
+    --min-p 0.0 \
+    --presence-penalty 1.5 \
+    --sglang-repetition-penalty 1.0 \
+    --input-file-path ./cache/dataset/perfectblend_train.jsonl \
+    --output-file-path ./cache/dataset/perfectblend_train_regen.jsonl \
+    --resume-by-id \
     --reasoning save
 """
 
@@ -34,10 +42,26 @@ import argparse
 import json
 import os
 import random
+import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
-from tqdm import tqdm
+_WRITE_LOCK = threading.Lock()
+
+try:
+    from tqdm import tqdm
+except ModuleNotFoundError:  # pragma: no cover
+
+    class tqdm:  # type: ignore[no-redef]
+        def __init__(self, iterable=None, total=None, desc=None, initial=0):
+            del total, desc, initial
+            self.iterable = iterable
+
+        def update(self, n=1):
+            del n
+
+        def __iter__(self):
+            return iter(self.iterable or [])
 
 try:
     from openai import OpenAI
@@ -51,6 +75,9 @@ try:
     from scripts.conversation_validation import has_think_marker, validate_conversation
 except ModuleNotFoundError:
     from conversation_validation import has_think_marker, validate_conversation
+
+MAX_LENGTH_MARGIN = 8
+MIN_NEW_TOKENS = 16
 
 
 def validate_regen_input(data: Any) -> str | None:
@@ -77,6 +104,68 @@ def count_lines(path: str) -> int:
         return sum(1 for _ in handle)
 
 
+def write_jsonl(handle, obj: Any) -> None:
+    payload = json.dumps(obj, ensure_ascii=False) + "\n"
+    with _WRITE_LOCK:
+        handle.write(payload)
+        handle.flush()
+
+
+def drop_truncated_trailing_line(path: str) -> None:
+    """Drop a partial last line so resume-by-id can reread complete JSONL."""
+    if not os.path.exists(path):
+        return
+    size = os.path.getsize(path)
+    if size == 0:
+        return
+    with open(path, "rb+") as handle:
+        data = handle.read()
+        if not data:
+            return
+        if not data.endswith(b"\n"):
+            last_nl = data.rfind(b"\n")
+            if last_nl == -1:
+                handle.seek(0)
+                handle.truncate(0)
+                return
+            data = data[: last_nl + 1]
+            handle.seek(0)
+            handle.write(data)
+            handle.truncate()
+        last_nl = data.rfind(b"\n")
+        prev_nl = data.rfind(b"\n", 0, last_nl)
+        last_line = data[prev_nl + 1 : last_nl]
+        if not last_line.strip():
+            return
+        try:
+            json.loads(last_line.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            keep_to = prev_nl + 1 if prev_nl != -1 else 0
+            handle.seek(keep_to)
+            handle.truncate()
+
+
+def load_jsonl_ids(path: str) -> Set[str]:
+    ids: Set[str] = set()
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return ids
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            row_id = row.get("id")
+            if row_id is not None and str(row_id).strip():
+                ids.add(str(row_id))
+    return ids
+
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -100,6 +189,12 @@ def parse_arguments():
         action="store_true",
         help="Whether the model is a GPT-OSS model",
     )
+    model_group.add_argument(
+        "--tokenizer-path",
+        type=str,
+        default=None,
+        help="Tokenizer used for --max-length prompt accounting (defaults to --model)",
+    )
 
     # sampling params
     sampling_params_group = parser.add_argument_group("sampling parameters")
@@ -122,16 +217,43 @@ def parse_arguments():
         help="Top-k sampling value sent via extra_body",
     )
     sampling_params_group.add_argument(
+        "--min-p",
+        type=float,
+        default=None,
+        help="min_p sampling value sent via extra_body",
+    )
+    sampling_params_group.add_argument(
+        "--presence-penalty",
+        type=float,
+        default=None,
+        help="OpenAI presence_penalty",
+    )
+    sampling_params_group.add_argument(
         "--repetition-penalty",
         type=float,
         default=None,
         help="Mapped to presence_penalty in the OpenAI API",
     )
     sampling_params_group.add_argument(
+        "--sglang-repetition-penalty",
+        type=float,
+        default=None,
+        help="SGLang repetition_penalty sent via extra_body",
+    )
+    sampling_params_group.add_argument(
         "--max-tokens",
         type=int,
         default=4096,
         help="Maximum number of tokens (default: 4096)",
+    )
+    sampling_params_group.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help=(
+            "Maximum prompt+completion tokens. When set, each turn uses "
+            "max_tokens = max_length - prompt_tokens - margin."
+        ),
     )
 
     # optimization
@@ -161,6 +283,11 @@ def parse_arguments():
         "--resume",
         action="store_true",
         help="Resume from existing output file, skip already processed samples",
+    )
+    data_group.add_argument(
+        "--resume-by-id",
+        action="store_true",
+        help="Resume by skipping ids already present in success/error/skipped files",
     )
 
     # sglang server
@@ -207,6 +334,61 @@ def compute_context_length(conversations: List[Dict[str, Any]]) -> int:
     return length
 
 
+def get_tokenizer(args):
+    cached = getattr(args, "_tokenizer", None)
+    if cached is not None:
+        return cached
+    from transformers import AutoTokenizer
+
+    path = getattr(args, "tokenizer_path", None) or args.model
+    tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+    args._tokenizer = tokenizer
+    return tokenizer
+
+
+def _template_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    template_messages = []
+    for message in messages:
+        template_messages.append(
+            {
+                "role": message["role"],
+                "content": message.get("content") or "",
+            }
+        )
+    return template_messages
+
+
+def count_prompt_tokens(args, messages: List[Dict[str, Any]]) -> int:
+    counter = getattr(args, "prompt_token_counter", None)
+    if counter is not None:
+        return int(counter(messages))
+    tokenizer = get_tokenizer(args)
+    template_messages = _template_messages(messages)
+    enable_thinking = getattr(args, "reasoning", "none") == "save"
+    kwargs = {
+        "tokenize": True,
+        "add_generation_prompt": True,
+        "enable_thinking": enable_thinking,
+    }
+    try:
+        rendered = tokenizer.apply_chat_template(template_messages, **kwargs)
+    except TypeError:
+        kwargs.pop("enable_thinking", None)
+        rendered = tokenizer.apply_chat_template(template_messages, **kwargs)
+    if hasattr(rendered, "input_ids"):
+        rendered = rendered.input_ids
+    if isinstance(rendered, dict):
+        rendered = rendered["input_ids"]
+    if rendered and isinstance(rendered[0], (list, tuple)):
+        return len(rendered[0])
+    return len(rendered)
+
+
+def remaining_completion_tokens(args, messages: List[Dict[str, Any]]) -> int:
+    prompt_tokens = count_prompt_tokens(args, messages)
+    return int(args.max_length) - prompt_tokens - MAX_LENGTH_MARGIN
+
+
 def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
@@ -230,9 +412,18 @@ def build_query_kwargs(args, messages, max_tokens=None):
         query_kwargs["top_p"] = args.top_p
     if args.repetition_penalty is not None:
         query_kwargs["presence_penalty"] = args.repetition_penalty
+    presence_penalty = getattr(args, "presence_penalty", None)
+    if presence_penalty is not None:
+        query_kwargs["presence_penalty"] = presence_penalty
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
+    min_p = getattr(args, "min_p", None)
+    if min_p is not None:
+        extra_body["min_p"] = min_p
+    sglang_repetition_penalty = getattr(args, "sglang_repetition_penalty", None)
+    if sglang_repetition_penalty is not None:
+        extra_body["repetition_penalty"] = sglang_repetition_penalty
     if args.reasoning == "disable":
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     elif args.reasoning == "save":
@@ -242,6 +433,10 @@ def build_query_kwargs(args, messages, max_tokens=None):
     if args.is_gpt_oss:
         query_kwargs["reasoning_effort"] = get_random_reasoning_effort()
     return query_kwargs
+
+
+def _has_assistant(messages: List[Dict[str, Any]]) -> bool:
+    return any(message.get("role") == "assistant" for message in messages)
 
 
 def call_sglang(
@@ -275,7 +470,25 @@ def call_sglang(
         elif message["role"] == "user":
             regenerated_messages.append(message)
 
-            query_kwargs = build_query_kwargs(args, regenerated_messages, max_tokens)
+            if max_tokens is not None:
+                turn_max_tokens = max_tokens
+            elif getattr(args, "max_length", None) is not None:
+                turn_max_tokens = remaining_completion_tokens(
+                    args, regenerated_messages
+                )
+                if turn_max_tokens < MIN_NEW_TOKENS:
+                    regenerated_messages.pop()
+                    if not _has_assistant(regenerated_messages):
+                        return set_skipped(
+                            data, "Prompt already fills max_length"
+                        )
+                    break
+            else:
+                turn_max_tokens = args.max_tokens
+
+            query_kwargs = build_query_kwargs(
+                args, regenerated_messages, turn_max_tokens
+            )
 
             try:
                 resp = client.chat.completions.create(**query_kwargs)
@@ -293,6 +506,8 @@ def call_sglang(
                     data,
                     "Non-reasoning assistant response is empty or contains a thinking marker",
                 )
+            if not isinstance(response_text, str):
+                response_text = "" if response_text is None else str(response_text)
             resp_msg = {
                 "role": "assistant",
                 "content": response_text,
@@ -304,18 +519,27 @@ def call_sglang(
                     model_extra = getattr(response_message, "model_extra", None)
                     if isinstance(model_extra, dict):
                         reasoning_content = model_extra.get("reasoning_content")
-                if max_tokens is None and (
-                    not isinstance(response_text, str)
-                    or not response_text.strip()
-                    or not isinstance(reasoning_content, str)
-                    or not reasoning_content.strip()
-                ):
-                    data["status"] = "error"
-                    data["error"] = (
-                        "Reasoning generation requires non-empty assistant content "
-                        "and reasoning_content"
+                if not isinstance(reasoning_content, str):
+                    reasoning_content = (
+                        "" if reasoning_content is None else str(reasoning_content)
                     )
-                    return data
+                missing = not response_text.strip() or not reasoning_content.strip()
+                if max_tokens is None and missing:
+                    # --max-length already reserved decode tokens. Keep a
+                    # truncated think/answer instead of dropping the row.
+                    if getattr(args, "max_length", None) is None:
+                        reason = (
+                            "Reasoning generation requires non-empty assistant "
+                            "content and reasoning_content"
+                        )
+                        finish_reason = getattr(
+                            resp.choices[0], "finish_reason", None
+                        )
+                        if finish_reason:
+                            reason = f"{reason} (finish_reason={finish_reason})"
+                        data["status"] = "error"
+                        data["error"] = reason
+                        return data
                 if max_tokens is None and (
                     has_think_marker(response_text)
                     or has_think_marker(reasoning_content)
@@ -335,6 +559,32 @@ def call_sglang(
     return data
 
 
+def _record_result(
+    regen_data,
+    output_file_handle,
+    error_file_handle,
+    skipped_file_handle,
+    stats,
+):
+    if regen_data["status"] == "error":
+        write_jsonl(error_file_handle, regen_data)
+        stats["error_samples"] += 1
+        return
+    if regen_data["status"] == "skipped":
+        write_jsonl(skipped_file_handle, regen_data)
+        stats["skipped_samples"] += 1
+        return
+    ctx_len = compute_context_length(regen_data.get("conversations", []))
+    stats["context_token_sum"] += ctx_len
+    if stats["context_token_min"] is None:
+        stats["context_token_min"] = ctx_len
+    else:
+        stats["context_token_min"] = min(stats["context_token_min"], ctx_len)
+    stats["context_token_max"] = max(stats["context_token_max"], ctx_len)
+    write_jsonl(output_file_handle, regen_data)
+    stats["success_samples"] += 1
+
+
 def main():
     # Parse command line arguments
     args = parse_arguments()
@@ -346,19 +596,28 @@ def main():
     if args.max_tokens <= 0:
         raise ValueError("Max tokens must be greater than 0")
 
+    if args.max_length is not None and args.max_length <= MAX_LENGTH_MARGIN:
+        raise ValueError("Max length must be greater than the context margin")
+
+    if args.resume and args.resume_by_id:
+        raise ValueError("Use either --resume or --resume-by-id, not both")
+
     print(f"Configuration:")
     print(f"  Model path: {args.model}")
     print(f"  Max tokens: {args.max_tokens}")
+    print(f"  Max length: {args.max_length}")
     print(f"  Concurrency: {args.concurrency}")
     print(f"  Temperature: {args.temperature}")
     print(f"  API URL: {args.server_address}")
     print(f"  Input file: {args.input_file_path}")
     print(f"  Output file: {args.output_file_path}")
     print(f"  Resume mode: {args.resume}")
+    print(f"  Resume by id: {args.resume_by_id}")
     print("-" * 50)
     total_lines = count_lines(args.input_file_path)
 
     skip_lines = 0
+    processed_ids: Set[str] = set()
     error_file_path = args.output_file_path.replace(".jsonl", "_error.jsonl")
     skipped_file_path = args.output_file_path.replace(".jsonl", "_skipped.jsonl")
 
@@ -379,6 +638,42 @@ def main():
         print("-" * 50)
 
         if skip_lines >= total_lines:
+            print(f"All {total_lines} samples already processed. Nothing to do.")
+            return
+
+    if args.resume_by_id:
+        for path in (args.output_file_path, skipped_file_path):
+            drop_truncated_trailing_line(path)
+            processed_ids |= load_jsonl_ids(path)
+        drop_truncated_trailing_line(error_file_path)
+        if os.path.exists(error_file_path) and os.path.getsize(error_file_path) > 0:
+            prev_error_path = error_file_path.replace(".jsonl", ".prev.jsonl")
+            with open(error_file_path, encoding="utf-8") as current:
+                previous_errors = current.read()
+            with open(prev_error_path, "a", encoding="utf-8") as previous:
+                previous.write(previous_errors)
+            with open(error_file_path, "w", encoding="utf-8"):
+                pass
+            print(f"Archived previous errors to {prev_error_path} for retry")
+        remaining_ids = 0
+        with open(args.input_file_path, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    row = json.loads(stripped)
+                except json.JSONDecodeError:
+                    remaining_ids += 1
+                    continue
+                row_id = row.get("id") if isinstance(row, dict) else None
+                if row_id is None or str(row_id) not in processed_ids:
+                    remaining_ids += 1
+        print("Resume-by-id mode enabled:")
+        print(f"  Found {len(processed_ids)} already processed ids")
+        print(f"  Remaining input rows: {remaining_ids}")
+        print("-" * 50)
+        if remaining_ids == 0:
             print(f"All {total_lines} samples already processed. Nothing to do.")
             return
 
@@ -406,8 +701,16 @@ def main():
     )
     print("-" * 50)
 
+    if args.max_length is not None and getattr(args, "prompt_token_counter", None) is None:
+        get_tokenizer(args)
+
     # Determine file open mode based on resume flag
-    file_mode = "a" if (args.resume and skip_lines > 0) else "w"
+    if args.resume_by_id:
+        file_mode = "a"
+    elif args.resume and skip_lines > 0:
+        file_mode = "a"
+    else:
+        file_mode = "w"
     print(
         f"Regenerating dataset and saving the output to {args.output_file_path} and error log to {error_file_path}"
     )
@@ -415,13 +718,17 @@ def main():
         f"File open mode: {file_mode} ({'append' if file_mode == 'a' else 'overwrite'})"
     )
     print("-" * 50)
-    context_token_sum = 0
-    context_token_min = None
-    context_token_max = 0
-    success_samples = 0
-    error_samples = 0
-    skipped_samples = 0
+    stats = {
+        "context_token_sum": 0,
+        "context_token_min": None,
+        "context_token_max": 0,
+        "success_samples": 0,
+        "error_samples": 0,
+        "skipped_samples": 0,
+    }
     submitted_samples = 0
+    skipped_existing = 0
+    pbar_initial = skip_lines if skip_lines > 0 else len(processed_ids)
 
     # Create progress bar
     with (
@@ -436,7 +743,7 @@ def main():
         waiting_queue = {
             server_address: [] for server_address in valid_server_addresses
         }
-        pbar = tqdm(total=total_lines, desc="Processing", initial=skip_lines)
+        pbar = tqdm(total=total_lines, desc="Processing", initial=pbar_initial)
         start_server_index = 0
 
         if skip_lines > 0:
@@ -450,13 +757,21 @@ def main():
                 break
 
             data = json.loads(line.strip())
+            row_id = data.get("id") if isinstance(data, dict) else None
+            if (
+                args.resume_by_id
+                and row_id is not None
+                and str(row_id) in processed_ids
+            ):
+                skipped_existing += 1
+                continue
+
             invalid_reason = validate_regen_input(data)
             if invalid_reason is not None:
-                skipped_file_handle.write(
-                    json.dumps(set_skipped(data, invalid_reason), ensure_ascii=False)
-                    + "\n"
+                write_jsonl(
+                    skipped_file_handle, set_skipped(data, invalid_reason)
                 )
-                skipped_samples += 1
+                stats["skipped_samples"] += 1
                 pbar.update(1)
                 continue
 
@@ -471,32 +786,13 @@ def main():
                 for req_future in waiting_queue[server_address]:
                     if req_future.done():
                         regen_data = req_future.result()
-
-                        if regen_data["status"] == "error":
-                            error_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            error_samples += 1
-                        elif regen_data["status"] == "skipped":
-                            skipped_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            skipped_samples += 1
-                        else:
-                            ctx_len = compute_context_length(
-                                regen_data.get("conversations", [])
-                            )
-                            context_token_sum += ctx_len
-                            if context_token_min is None:
-                                context_token_min = ctx_len
-                            else:
-                                context_token_min = min(context_token_min, ctx_len)
-                            context_token_max = max(context_token_max, ctx_len)
-
-                            output_file_handle.write(
-                                json.dumps(regen_data, ensure_ascii=False) + "\n"
-                            )
-                            success_samples += 1
+                        _record_result(
+                            regen_data,
+                            output_file_handle,
+                            error_file_handle,
+                            skipped_file_handle,
+                            stats,
+                        )
                         waiting_queue[server_address].remove(req_future)
                         finished_on_request = True
 
@@ -517,31 +813,20 @@ def main():
         for server_address, waiting_queue_items in waiting_queue.items():
             for req_future in waiting_queue_items:
                 regen_data = req_future.result()
-                if regen_data["status"] == "error":
-                    error_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    error_samples += 1
-                elif regen_data["status"] == "skipped":
-                    skipped_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    skipped_samples += 1
-                else:
-                    ctx_len = compute_context_length(
-                        regen_data.get("conversations", [])
-                    )
-                    context_token_sum += ctx_len
-                    if context_token_min is None:
-                        context_token_min = ctx_len
-                    else:
-                        context_token_min = min(context_token_min, ctx_len)
-                    context_token_max = max(context_token_max, ctx_len)
+                _record_result(
+                    regen_data,
+                    output_file_handle,
+                    error_file_handle,
+                    skipped_file_handle,
+                    stats,
+                )
 
-                    output_file_handle.write(
-                        json.dumps(regen_data, ensure_ascii=False) + "\n"
-                    )
-                    success_samples += 1
+    success_samples = stats["success_samples"]
+    error_samples = stats["error_samples"]
+    skipped_samples = stats["skipped_samples"]
+    context_token_sum = stats["context_token_sum"]
+    context_token_min = stats["context_token_min"]
+    context_token_max = stats["context_token_max"]
 
     print(f"\nProcessing completed!")
     if success_samples > 0:
@@ -555,15 +840,16 @@ def main():
         print("No successful examples to compute context length statistics.")
 
     total_processed = success_samples + error_samples + skipped_samples
-    if skip_lines > 0:
+    if skip_lines > 0 or skipped_existing > 0:
+        previously = skip_lines if skip_lines > 0 else skipped_existing
         print(f"\nResume processing completed!")
-        print(f"  Previously processed: {skip_lines}")
+        print(f"  Previously processed: {previously}")
         print(
             f"  Newly processed: {total_processed} "
             f"({success_samples} success, {error_samples} failed, "
             f"{skipped_samples} skipped)"
         )
-        print(f"  Total: {skip_lines + total_processed}")
+        print(f"  Total: {previously + total_processed}")
     else:
         print(
             f"\nProcessing completed! {success_samples} samples regenerated, "

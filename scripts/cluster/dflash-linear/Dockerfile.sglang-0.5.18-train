@@ -1,0 +1,21 @@
+# SpecForge training image (FLA + tensorboard). Not for live SGLang DFLASH.
+# Serving / DFlash2DraftModel uses Dockerfile.sglang-0.5.19.
+# SpecForge stays bind-mounted at runtime (pip install -e --no-deps).
+# Do not install the [rocm] extra's torch pin over the image wheel.
+FROM lmsysorg/sglang:v0.5.18-rocm700-mi35x
+
+WORKDIR /workspace
+ENV PYTHONPATH=/sgl-workspace/sglang/python
+
+RUN python3 -c "import torch; open('/tmp/torch_ver','w').write(torch.__version__); print('torch', torch.__version__, 'hip', getattr(torch.version,'hip',None))" \
+ && python3 -m pip install --no-cache-dir einops tensorboard \
+ && python3 -m pip install --no-cache-dir 'flash-linear-attention[rocm]' \
+ && python3 - <<'PY'
+import torch
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+before = open("/tmp/torch_ver").read().strip()
+got = torch.__version__
+if got != before:
+    raise SystemExit(f"torch replaced {before} -> {got}")
+print("fla_ok", "torch", got, "chunk", chunk_gated_delta_rule)
+PY

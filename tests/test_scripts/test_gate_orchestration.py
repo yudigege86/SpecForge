@@ -267,6 +267,158 @@ class TestNormalizeDFlashExport(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "positive integer markov_rank"):
                 self.module.normalize_export(str(path), 16)
 
+    def test_preserves_dflash_linear_architecture_and_auto_map(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlashLinearDraftModel"],
+                        "auto_map": {
+                            "AutoModel": "dflash_linear.DFlashLinearDraftModel"
+                        },
+                        "block_size": 16,
+                        "dflash_config": {
+                            "mask_token_id": 248070,
+                            "linear_context": {
+                                "variant": "gdn",
+                                "injection": "gated_residual",
+                                "num_heads": 8,
+                                "key_dim": 64,
+                                "value_dim": 64,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            normalized = self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(normalized["architectures"], ["DFlashLinearDraftModel"])
+            self.assertEqual(
+                normalized["auto_map"]["AutoModel"],
+                "dflash_linear.DFlashLinearDraftModel",
+            )
+            self.assertEqual(
+                normalized["dflash_config"]["linear_context"]["variant"], "gdn"
+            )
+            self.assertEqual(json.loads(path.read_text()), normalized)
+
+    def test_rejects_dflash_linear_without_linear_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = {
+                "architectures": ["DFlashLinearDraftModel"],
+                "auto_map": {"AutoModel": "dflash_linear.DFlashLinearDraftModel"},
+                "block_size": 16,
+                "dflash_config": {"mask_token_id": 248070},
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "linear_context"):
+                self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_preserves_dflash2_linear_architecture_and_writes_feature_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2LinearDraftModel"],
+                        "auto_map": {
+                            "AutoModel": "dflash2_linear.DFlash2LinearDraftModel"
+                        },
+                        "block_size": 16,
+                        "dflash_config": {
+                            "mask_token_id": 248070,
+                            "target_layer_ids": [1, 8, 15, 22, 29],
+                            "conv_kernel_size": 2,
+                            "conv_group_size": 16,
+                            "selector_rank": 256,
+                            "selector_top_k": 16,
+                            "linear_context": {
+                                "variant": "gdn",
+                                "injection": "gated_residual",
+                                "num_heads": 8,
+                                "key_dim": 64,
+                                "value_dim": 64,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            normalized = self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(
+                normalized["architectures"], ["DFlash2LinearDraftModel"]
+            )
+            self.assertEqual(
+                normalized["auto_map"]["AutoModel"],
+                "dflash2_linear.DFlash2LinearDraftModel",
+            )
+            self.assertEqual(normalized["dflash_config"]["conv_kernel_size"], 2)
+            self.assertEqual(json.loads(path.read_text()), normalized)
+            contract = json.loads(
+                (path.parent / "feature_contract.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                contract["architectures"], ["DFlash2LinearDraftModel"]
+            )
+            self.assertEqual(
+                contract["linear_context"]["injection"], "gated_residual"
+            )
+
+    def test_rejects_dflash2_linear_without_linear_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            original = {
+                "architectures": ["DFlash2LinearDraftModel"],
+                "auto_map": {
+                    "AutoModel": "dflash2_linear.DFlash2LinearDraftModel"
+                },
+                "block_size": 16,
+                "dflash_config": {
+                    "mask_token_id": 248070,
+                    "conv_kernel_size": 2,
+                    "conv_group_size": 16,
+                    "selector_rank": 256,
+                    "selector_top_k": 16,
+                },
+            }
+            path.write_text(json.dumps(original), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "linear_context"):
+                self.module.normalize_export(str(path), 16)
+
+            self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_rejects_incomplete_dflash2_linear_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "architectures": ["DFlash2LinearDraftModel"],
+                        "block_size": 16,
+                        "dflash_config": {
+                            "conv_kernel_size": 2,
+                            "conv_group_size": 16,
+                            "selector_rank": 256,
+                            "linear_context": {"variant": "gdn"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "selector_top_k"):
+                self.module.normalize_export(str(path), 16)
+
     def test_rejects_a_mismatched_block_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
