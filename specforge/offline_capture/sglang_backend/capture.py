@@ -137,6 +137,7 @@ class OfflineSGLangCaptureBackend:
             chunked_prefill_size=-1,
             tp_size=tp_size,
             pp_size=1,
+            device=kwargs.pop("device", "cuda"),
             **kwargs,
         )
         if publish_runtime_config is not None:

@@ -391,8 +391,17 @@ def initialize_dp_attention(
     else:
         dp_attention._ATTN_DP_SIZE = dp_size if enable_dp_attention else 1
 
+    device = getattr(server_args, "device", None)
+    if not device:
+        try:
+            from sglang.srt.runtime_context import get_device as get_runtime_device
+
+            device = get_runtime_device().device
+        except Exception:
+            device = "cuda"
+
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
-        device=torch.device(server_args.device),
+        device=torch.device(device),
     )
