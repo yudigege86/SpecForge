@@ -92,15 +92,25 @@ def _load_vocab_mapping(cfg: Config, draft_model: Any) -> None:
         draft_model.load_vocab_mapping(cfg.model.vocab_mapping_path)
 
 
+def _require_identity_vocab_mapping(draft_model: Any) -> None:
+    t2d = getattr(draft_model, "t2d", None)
+    if t2d is None or not bool(t2d.all().item()):
+        raise ValueError(
+            "efficient_lm_head_config trains a full-vocab candidate head; "
+            "vocab_mapping_path must be identity"
+        )
+
+
 def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
     from specforge.modeling.draft.eagle4_structure import parse_efficient_lm_head_config
 
     if parse_efficient_lm_head_config(draft_config) is not None:
-        if cfg.model.vocab_mapping_path:
+        if not cfg.model.draft_checkpoint_path:
             raise ValueError(
-                "efficient_lm_head_config trains a full-vocab candidate head; "
-                "do not pass model.vocab_mapping_path"
+                "efficient_lm_head_config trains the low-rank candidate head "
+                "from a dense drafter; set model.draft_checkpoint_path to a "
+                "stage-1 export"
             )
         draft_vocab = getattr(draft_config, "draft_vocab_size", None)
         if draft_vocab is not None and int(draft_vocab) != int(draft_config.vocab_size):
@@ -137,7 +147,11 @@ def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
         and extra_missing.intersection(report.missing_keys)
     ):
         draft_model.init_efficient_head_from_dense()
-    if extra_missing is None:
+    if extra_missing is not None:
+        draft_model.freeze_non_candidate_parameters()
+        _load_vocab_mapping(cfg, draft_model)
+        _require_identity_vocab_mapping(draft_model)
+    else:
         _load_vocab_mapping(cfg, draft_model)
     if cfg.model.load_target_embedding:
         draft_model.load_embedding(

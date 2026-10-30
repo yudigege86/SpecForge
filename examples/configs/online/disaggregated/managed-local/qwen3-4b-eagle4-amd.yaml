@@ -2,13 +2,17 @@
 #
 # SpecForge has no online colocated topology. This managed-local recipe is the
 # same-node path: one `specforge train` owns Mooncake, the SGLang capture
-# server (GPU 0), and the trainer (GPU 1). Capture method is eagle3 (EAGLE-4
-# reuses that aux layout). Requires the v0.5.18 spec-capture patch, not a
-# Muse Spark image.
+# server (GPU 0), and seven trainer ranks (GPUs 1-7). Capture method is eagle3
+# (EAGLE-4 reuses that aux layout). Requires the v0.5.18 spec-capture patch,
+# not a Muse Spark image.
 #
 #   specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-amd.yaml
 #
-# Stage 1 trains a full-vocab dense lm_head. Do not pass vocab_mapping_path.
+# Stage 1 trains a full-vocab dense lm_head. Offline can omit
+# vocab_mapping_path. Disaggregated online still requires a shared
+# model.vocab_mapping_path; pass an identity mapping
+# (d2t=zeros(V), t2d=ones(V, dtype=bool)) so producer and consumer
+# share the default full-vocab buffers.
 model:
   target_model_path: "Qwen/Qwen3-4B"
   draft_model_config: "configs/qwen3-4b-eagle4.json"
@@ -47,7 +51,7 @@ deployment:
   mode: disaggregated
   trainer:
     nnodes: 1
-    nproc_per_node: 1
+    nproc_per_node: 7
   disaggregated:
     control_dir: outputs/qwen3-4b-eagle4-online/control
     consumer_state_dir: outputs/qwen3-4b-eagle4-online/consumer-state
@@ -55,6 +59,12 @@ deployment:
     managed_local:
       trainer_cuda_visible_devices:
         - "1"
+        - "2"
+        - "3"
+        - "4"
+        - "5"
+        - "6"
+        - "7"
       mooncake:
         protocol: tcp
         global_segment_size_bytes: 34359738368

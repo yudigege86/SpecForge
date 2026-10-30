@@ -24,6 +24,14 @@ from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
     parse_efficient_lm_head_config,
+    retrieval_positive_count,
+)
+
+_CANDIDATE_HEAD_PARAM_NAMES = frozenset(
+    {
+        "efficient_lm_head.weight",
+        "efficient_lm_head_down_proj.weight",
+    }
 )
 from specforge.modeling.draft.llama3_eagle import (
     LlamaDecoderLayer,
@@ -59,6 +67,78 @@ def candidate_logits(
         torch.finfo(hidden_states.dtype).min,
     )
     return logits.scatter_(-1, indices, rescored.to(logits.dtype))
+
+
+def cutoff_retrieval_loss(
+    dense_logits: torch.Tensor,
+    low_rank_scores: torch.Tensor,
+    num_candidates: int,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Pairwise logistic across the ``(C - m + 1)``-th non-positive cutoff.
+
+    ``dense_logits`` (``z``) and ``low_rank_scores`` (``s``) share shape
+    ``[..., V]``. Positives are the top-``m`` tokens of ``z``. Temperature-1
+    ``softmax(z)`` weights the terms and is stop-gradient. The cutoff index is
+    stop-gradient; its score still receives gradient.
+    """
+
+    vocab_size = dense_logits.shape[-1]
+    positive_count = retrieval_positive_count(num_candidates, vocab_size)
+    flat_scores = low_rank_scores.reshape(-1, vocab_size).float()
+    with torch.no_grad():
+        flat_dense = dense_logits.reshape(-1, vocab_size).float()
+        positives = flat_dense.topk(positive_count, dim=-1).indices
+        log_normalizer = torch.logsumexp(flat_dense, dim=-1, keepdim=True)
+        positive_mass = (flat_dense.gather(-1, positives) - log_normalizer).exp()
+    if loss_mask is None:
+        token_mask = flat_scores.new_ones(flat_scores.shape[0])
+    else:
+        token_mask = loss_mask.reshape(flat_scores.shape[0]).to(dtype=flat_scores.dtype)
+    denom = token_mask.sum().clamp_min(1.0)
+
+    positive_mask = torch.zeros(
+        flat_scores.shape, dtype=torch.bool, device=flat_scores.device
+    )
+    positive_mask.scatter_(-1, positives, True)
+    non_positive = flat_scores.masked_fill(
+        positive_mask, torch.finfo(flat_scores.dtype).min
+    )
+    cutoff_rank = num_candidates - positive_count + 1
+    cutoff_choice = non_positive.topk(cutoff_rank, dim=-1)
+    cutoff_index = cutoff_choice.indices[:, -1].unsqueeze(-1).detach()
+    cutoff = flat_scores.gather(-1, cutoff_index).squeeze(-1)
+    positive_scores = flat_scores.gather(-1, positives)
+    below_cutoff = (
+        (positive_scores <= cutoff.unsqueeze(-1)).to(dtype=flat_scores.dtype).detach()
+    )
+    per_token = (
+        positive_mass
+        * below_cutoff
+        * F.softplus(cutoff.unsqueeze(-1) - positive_scores)
+    ).sum(-1)
+    loss = (per_token * token_mask).sum() / denom
+
+    with torch.no_grad():
+        retrieved = flat_scores.topk(num_candidates, dim=-1).indices
+        hits = (positives.unsqueeze(-1) == retrieved.unsqueeze(1)).any(-1)
+        hit_top1 = (hits[:, 0].to(flat_scores.dtype) * token_mask).sum() / denom
+        hit_mean = (hits.to(flat_scores.dtype) * token_mask.unsqueeze(-1)).sum() / (
+            denom * positive_count
+        )
+        retrieved_mass = (
+            (flat_dense.gather(-1, retrieved) - log_normalizer).exp().sum(-1)
+        )
+        mass = (retrieved_mass * token_mask).sum() / denom
+    metrics = {
+        "retrieval_hit_1": hit_top1,
+        "retrieval_hit_mean": hit_mean,
+        "retrieval_mass": mass,
+        "denom": denom,
+        "cutoff_index": cutoff_index.squeeze(-1),
+        "positives": positives,
+    }
+    return loss, metrics
 
 
 @register_draft
@@ -120,11 +200,10 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
             self.efficient_lm_head = None
             self.num_candidates = None
 
-        if self.efficient_lm_head_config is None:
-            self.register_buffer("t2d", torch.ones(self.vocab_size, dtype=torch.bool))
-            self.register_buffer(
-                "d2t", torch.zeros(self.draft_vocab_size, dtype=torch.int64)
-            )
+        self.register_buffer("t2d", torch.ones(self.vocab_size, dtype=torch.bool))
+        self.register_buffer(
+            "d2t", torch.zeros(self.draft_vocab_size, dtype=torch.int64)
+        )
 
         self.post_init()
 
@@ -202,6 +281,44 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         k = min(self.num_candidates, approx.shape[-1])
         indices = approx.topk(k, dim=-1).indices
         return (indices == target_ids.unsqueeze(-1)).any(dim=-1).float().mean()
+
+    def freeze_non_candidate_parameters(self) -> None:
+        """Train only the low-rank factors; freeze the dense drafter."""
+
+        if self.efficient_lm_head is None:
+            raise RuntimeError(
+                "freeze_non_candidate_parameters requires efficient_lm_head_config"
+            )
+        for name, param in self.named_parameters():
+            param.requires_grad = name in _CANDIDATE_HEAD_PARAM_NAMES
+
+    def retrieval_loss(
+        self,
+        hidden_states: torch.Tensor,
+        loss_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Cutoff retrieval loss on detached draft hidden states.
+
+        Positives are the dense head's top-``m`` tokens, weighted by
+        ``softmax(z)`` at temperature 1. ``τ`` is the ``(C - m + 1)``-th
+        non-positive low-rank score. The index of ``τ`` is stop-gradient;
+        its score still receives gradient.
+        """
+
+        if self.efficient_lm_head is None:
+            raise RuntimeError("retrieval_loss requires efficient_lm_head_config")
+        hidden = self.norm(hidden_states)
+        scores = F.linear(
+            F.linear(hidden, self.efficient_lm_head_down_proj.weight),
+            self.efficient_lm_head.weight,
+        )
+        dense = F.linear(hidden, self.lm_head.weight)
+        return cutoff_retrieval_loss(
+            dense,
+            scores,
+            int(self.num_candidates),
+            loss_mask=loss_mask,
+        )
 
     @torch.no_grad()
     def init_efficient_head_from_dense(
@@ -298,4 +415,4 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         return self.next_depth_hidden(hidden_states)
 
 
-__all__ = ["LlamaForCausalLMEagle4", "candidate_logits"]
+__all__ = ["LlamaForCausalLMEagle4", "candidate_logits", "cutoff_retrieval_loss"]

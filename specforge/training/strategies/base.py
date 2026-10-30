@@ -186,6 +186,11 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
         self.eagle3_model = eagle3_model
         self.target_head = target_head
         self.name = name
+        live = eagle3_model
+        if not hasattr(live, "draft_model") and hasattr(live, "module"):
+            live = live.module
+        if getattr(live, "objective_metric_name", None) == "retrieval_loss":
+            ploss_decay = 1.0
         self.ploss_decay = ploss_decay
         self.trim_loss_positions = trim_loss_positions
         self.compact_teacher = compact_teacher
@@ -368,6 +373,16 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
             metrics["candidate_recall"] = (
                 recall.detach() if isinstance(recall, torch.Tensor) else recall
             )
+        for key in (
+            "retrieval_hit_1",
+            "retrieval_hit_mean",
+            "retrieval_mass",
+        ):
+            value = getattr(live, f"last_{key}", None)
+            if value is not None:
+                metrics[key] = (
+                    value.detach() if isinstance(value, torch.Tensor) else value
+                )
         imbalance = getattr(self, "_moe_load_imbalance", None)
         if imbalance is not None:
             metrics["moe_load_imbalance"] = imbalance

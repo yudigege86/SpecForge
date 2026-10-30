@@ -1,0 +1,43 @@
+# Qwen3-4B EAGLE-4 stage-2 candidate head, offline — AMD ROCm.
+#
+# Train only the low-rank factors A, B from a dense stage-1 export. Point
+# model.draft_checkpoint_path at that export (a SpecForge checkpoint directory
+# or a HuggingFace draft folder). Capture is the same as stage 1.
+#
+#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-candidates-amd.yaml
+model:
+  target_model_path: "Qwen/Qwen3-4B"
+  draft_model_config: "configs/qwen3-4b-eagle4-candidates.json"
+  draft_checkpoint_path: "./outputs/qwen3-4b-eagle4-offline"
+  target_backend: "sglang"
+  embedding_key: "model.embed_tokens.weight"
+  torch_dtype: "bfloat16"
+  use_liger_kernel: false
+data:
+  hidden_states_path: "./cache/hidden_states/qwen3-4b-eagle4-sharegpt"
+  max_length: 2048
+  chat_template: "qwen"
+  cache_dir: "./cache"
+training:
+  strategy: "eagle4"
+  num_epochs: 1
+  max_steps: 20
+  batch_size: 1
+  learning_rate: 0.0001
+  max_grad_norm: 0.5
+  ttt_length: 7
+  attention_backend: "flex_attention"
+  save_interval: 20
+  log_interval: 1
+  dist_timeout: 20
+  seed: 0
+tracking:
+  report_to: "tensorboard"
+run_id: "qwen3-4b-eagle4-candidates-offline"
+output_dir: "./outputs/qwen3-4b-eagle4-candidates-offline"
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 1

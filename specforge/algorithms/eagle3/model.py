@@ -167,6 +167,11 @@ class OnlineEagle3Model(Eagle3Model):
         self.lk_loss_type = lk_loss_type
         self.kl_scale = kl_scale
         self.kl_decay = kl_decay
+        self.objective_metric_name = (
+            "retrieval_loss"
+            if getattr(draft_model, "efficient_lm_head", None) is not None
+            else None
+        )
 
     def _make_adapter(self) -> BackendAdapter:
         if self.attention_backend == "usp":
@@ -237,6 +242,49 @@ class OnlineEagle3Model(Eagle3Model):
             local_denom,
             loss.detach(),
             loss_denom,
+        )
+
+    def _retrieval_acc_and_loss(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+        adapter: BackendAdapter,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        loss, metrics = self.draft_model.retrieval_loss(
+            hidden_states.detach(),
+            loss_mask=loss_mask,
+        )
+        denom = metrics["denom"]
+        hit_top1 = metrics["retrieval_hit_1"]
+        hit_mean = metrics["retrieval_hit_mean"]
+        local_correct = hit_top1 * denom
+        local_correct, local_denom = adapter.reduce_metrics(
+            local_correct=local_correct, local_denom=denom
+        )
+        acc = local_correct / local_denom.clamp_min(1e-6)
+        loss_sum = loss * denom
+        reduced_sum, reduced_denom = adapter.reduce_metrics(
+            local_correct=loss_sum, local_denom=denom
+        )
+        loss = reduced_sum / reduced_denom.clamp_min(1e-6)
+        self._last_retrieval_metrics = metrics
+        return (
+            acc,
+            hit_mean.detach(),
+            loss,
+            local_correct.detach(),
+            local_denom.detach(),
+            loss.detach(),
+            reduced_denom.detach(),
         )
 
     def _prepare_position_ids(
@@ -321,6 +369,10 @@ class OnlineEagle3Model(Eagle3Model):
         adapter = self._make_adapter()
         t2d = _draft_t2d(self.draft_model, hidden_states.device)
         self.last_candidate_recall = None
+        self.last_retrieval_hit_1 = None
+        self.last_retrieval_hit_mean = None
+        self.last_retrieval_mass = None
+        self._last_retrieval_metrics = None
         # Step 1: handle vocab size
         if target_hidden_for_compact is not None:
             (
@@ -437,6 +489,12 @@ class OnlineEagle3Model(Eagle3Model):
         metric_losses = []
         metric_loss_denoms = []
         candidate_recalls = []
+        retrieval_hit_1s = []
+        retrieval_hit_means = []
+        retrieval_masses = []
+        uses_retrieval_loss = (
+            getattr(self.draft_model, "efficient_lm_head", None) is not None
+        )
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
@@ -519,7 +577,6 @@ class OnlineEagle3Model(Eagle3Model):
                 keep_j = trim_pack["keep_steps"][idx]
                 nrows_j = trim_pack["nrows_steps"][idx]
                 selected_hidden = logit_hidden.index_select(1, rows_j)
-                logits = self.draft_model.compute_logits(selected_hidden)
                 pm_j = trim_pack["position_mask_sup"].index_select(1, keep_j)
                 lm_j = trim_pack["loss_mask_sup"].index_select(1, keep_j)
                 if nrows_j == 0:
@@ -531,6 +588,45 @@ class OnlineEagle3Model(Eagle3Model):
                     pm_j = torch.zeros_like(pm_j)
                     lm_j = torch.zeros_like(lm_j)
                 target_token_ids = trim_pack["token_ids_c"].index_select(1, keep_j)
+                if uses_retrieval_loss:
+                    (
+                        acc,
+                        acceptance_rate,
+                        loss,
+                        correct,
+                        denom,
+                        metric_loss,
+                        loss_denom,
+                    ) = self._retrieval_acc_and_loss(
+                        hidden_states=selected_hidden,
+                        loss_mask=lm_j,
+                        adapter=adapter,
+                    )
+                else:
+                    logits = self.draft_model.compute_logits(selected_hidden)
+                    (
+                        acc,
+                        acceptance_rate,
+                        loss,
+                        correct,
+                        denom,
+                        metric_loss,
+                        loss_denom,
+                    ) = self._acc_and_loss(
+                        logits=logits,
+                        target_p=trim_pack["target_p_c"].index_select(1, keep_j),
+                        target_p_on_draft=trim_pack["on_draft_c"].index_select(1, keep_j),
+                        target_token_ids=target_token_ids,
+                        position_mask=pm_j,
+                        loss_mask=lm_j,
+                        adapter=adapter,
+                        loss_scale=nrows_j / trim_pack["full_len"],
+                        full_positions=trim_pack["full_len"],
+                    )
+                if nrows_j > 0:
+                    recall_hidden = selected_hidden
+                    recall_ids = target_token_ids
+            elif uses_retrieval_loss:
                 (
                     acc,
                     acceptance_rate,
@@ -539,20 +635,13 @@ class OnlineEagle3Model(Eagle3Model):
                     denom,
                     metric_loss,
                     loss_denom,
-                ) = self._acc_and_loss(
-                    logits=logits,
-                    target_p=trim_pack["target_p_c"].index_select(1, keep_j),
-                    target_p_on_draft=trim_pack["on_draft_c"].index_select(1, keep_j),
-                    target_token_ids=target_token_ids,
-                    position_mask=pm_j,
-                    loss_mask=lm_j,
+                ) = self._retrieval_acc_and_loss(
+                    hidden_states=logit_hidden,
+                    loss_mask=state.loss_mask,
                     adapter=adapter,
-                    loss_scale=nrows_j / trim_pack["full_len"],
-                    full_positions=trim_pack["full_len"],
                 )
-                if nrows_j > 0:
-                    recall_hidden = selected_hidden
-                    recall_ids = target_token_ids
+                recall_hidden = logit_hidden
+                recall_ids = state.target_token_ids
             else:
                 logits = self.draft_model.compute_logits(logit_hidden)
                 (
@@ -588,6 +677,11 @@ class OnlineEagle3Model(Eagle3Model):
                 and recall_hidden is not None
             ):
                 candidate_recalls.append(recall_fn(recall_hidden, recall_ids))
+            last_retrieval = getattr(self, "_last_retrieval_metrics", None)
+            if last_retrieval is not None:
+                retrieval_hit_1s.append(last_retrieval["retrieval_hit_1"])
+                retrieval_hit_means.append(last_retrieval["retrieval_hit_mean"])
+                retrieval_masses.append(last_retrieval["retrieval_mass"])
 
             if not is_last:
                 # Step 5.7: we need to update the loss mask
@@ -597,6 +691,10 @@ class OnlineEagle3Model(Eagle3Model):
                 # Flex attention mask shirnking is handled inside attention module
         if candidate_recalls:
             self.last_candidate_recall = torch.stack(candidate_recalls).mean()
+        if retrieval_hit_1s:
+            self.last_retrieval_hit_1 = torch.stack(retrieval_hit_1s).mean()
+            self.last_retrieval_hit_mean = torch.stack(retrieval_hit_means).mean()
+            self.last_retrieval_mass = torch.stack(retrieval_masses).mean()
         return (
             plosses,
             acceptance_rates,

@@ -92,9 +92,34 @@ def parse_efficient_lm_head_config(config: Any) -> Optional[dict]:
     return parsed
 
 
+def retrieval_positive_count(num_candidates: int, vocab_size: int) -> int:
+    """Dense-head positives ``m = min(32, C // 4)`` for the retrieval cutoff.
+
+    ``C`` is the serving candidate budget. ``m < C`` keeps slack in the
+    retrieved set. ``C >= 4`` so ``m >= 1``.
+    """
+
+    if not isinstance(num_candidates, int) or isinstance(num_candidates, bool):
+        raise ValueError(
+            f"num_candidates must be an int, got {num_candidates!r}"
+        )
+    if num_candidates < 4:
+        raise ValueError(
+            "retrieval loss requires num_candidates >= 4 so m = min(32, "
+            f"C // 4) is at least 1; got {num_candidates}"
+        )
+    if num_candidates >= vocab_size:
+        raise ValueError(
+            "retrieval loss needs num_candidates < vocab_size so a "
+            f"non-positive cutoff exists; got C={num_candidates}, V={vocab_size}"
+        )
+    return min(32, num_candidates // 4)
+
+
 __all__ = [
     "EAGLE4_ARCH",
     "draft_sliding_window",
     "draft_uses_rope",
     "parse_efficient_lm_head_config",
+    "retrieval_positive_count",
 ]

@@ -19,7 +19,11 @@ except ImportError:
 
 from specforge.modeling._mask_utils import _make_causal_mask
 from specforge.modeling.auto import AutoDraftModel
-from specforge.modeling.draft.eagle4 import LlamaForCausalLMEagle4, candidate_logits
+from specforge.modeling.draft.eagle4 import (
+    LlamaForCausalLMEagle4,
+    candidate_logits,
+    cutoff_retrieval_loss,
+)
 from specforge.modeling.draft.eagle4_moe import (
     Eagle4MoE,
     _expert_mlp,
@@ -32,6 +36,7 @@ from specforge.modeling.draft.eagle4_structure import (
     draft_sliding_window,
     draft_uses_rope,
     parse_efficient_lm_head_config,
+    retrieval_positive_count,
 )
 from specforge.modeling.draft.flex_attention import generate_eagle3_mask
 from specforge.modeling.draft.llama3_eagle import (
@@ -108,6 +113,13 @@ class Eagle4StructureTest(unittest.TestCase):
             parse_efficient_lm_head_config(
                 _config(efficient_lm_head_config={"type": "full", "rank": 4})
             )
+
+    def test_retrieval_positive_count(self):
+        self.assertEqual(32, retrieval_positive_count(128, 151936))
+        self.assertEqual(2, retrieval_positive_count(8, 16))
+        self.assertEqual(1, retrieval_positive_count(4, 16))
+        with self.assertRaisesRegex(ValueError, "num_candidates >= 4"):
+            retrieval_positive_count(3, 16)
 
 
 class Eagle4FusionTest(unittest.TestCase):
@@ -329,8 +341,8 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
         self.assertEqual((4, 8), tuple(model.efficient_lm_head_down_proj.weight.shape))
         self.assertEqual((16, 4), tuple(model.efficient_lm_head.weight.shape))
         self.assertEqual((16, 8), tuple(model.lm_head.weight.shape))
-        self.assertFalse(hasattr(model, "t2d"))
-        self.assertFalse(hasattr(model, "d2t"))
+        self.assertTrue(bool(model.t2d.all().item()))
+        self.assertEqual((16,), tuple(model.d2t.shape))
 
         hidden = torch.randn(2, 3, 8)
         logits = candidate_logits(
@@ -389,8 +401,8 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
         self.assertIn("lm_head.weight", state)
         self.assertIn("efficient_lm_head.weight", state)
         self.assertIn("efficient_lm_head_down_proj.weight", state)
-        self.assertNotIn("t2d", state)
-        self.assertNotIn("d2t", state)
+        self.assertIn("t2d", state)
+        self.assertIn("d2t", state)
 
         with tempfile.TemporaryDirectory() as directory:
             model.save_pretrained(directory)
@@ -425,12 +437,226 @@ class Eagle4CandidateHeadTest(unittest.TestCase):
         recall = model.candidate_recall(hidden, target)
         self.assertGreater(float(recall), 0.99)
 
+    def test_stage1_compute_logits_is_the_dense_head(self):
+        model = LlamaForCausalLMEagle4(_config(), attention_backend="sdpa")
+        self.assertIsNone(model.efficient_lm_head)
+        raw = torch.randn(2, 3, 8)
+        torch.testing.assert_close(
+            model.compute_logits(raw), model.lm_head(model.norm(raw))
+        )
+
+    def test_only_candidate_factors_are_trainable(self):
+        model = LlamaForCausalLMEagle4(self._head_config(), attention_backend="sdpa")
+        model.freeze_non_candidate_parameters()
+        trainable = {
+            name for name, param in model.named_parameters() if param.requires_grad
+        }
+        self.assertEqual(
+            {"efficient_lm_head.weight", "efficient_lm_head_down_proj.weight"},
+            trainable,
+        )
+
+
+class Eagle4RetrievalLossTest(unittest.TestCase):
+    def test_cutoff_is_the_nth_non_positive_and_in_set_swap_still_has_loss(self):
+        # C=8, m=2, τ is the 7th non-positive. Token 0 is the only retrieved
+        # positive and sits at ρ_C, so it is in S but still below τ.
+        vocab = 16
+        candidate_count = 8
+        dense = torch.zeros(1, vocab)
+        dense[0, 0] = 4.0
+        dense[0, 1] = 3.0
+        ranking = torch.tensor(
+            [2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11, 12, 13, 14, 15, 1]
+        )
+        values = torch.arange(vocab, 0, -1, dtype=torch.float32)
+        scores = torch.zeros(1, vocab, requires_grad=True)
+        with torch.no_grad():
+            scores[0, ranking] = values
+        loss, metrics = cutoff_retrieval_loss(dense, scores, candidate_count)
+        self.assertEqual(8, int(metrics["cutoff_index"][0].item()))
+        self.assertEqual([0, 1], metrics["positives"][0].tolist())
+        self.assertGreater(float(loss.detach()), 0.0)
+        retrieved = scores.detach().topk(candidate_count, dim=-1).indices[0].tolist()
+        self.assertIn(0, retrieved)
+        self.assertNotIn(1, retrieved)
+
+    def test_positive_above_cutoff_has_zero_gradient(self):
+        vocab = 16
+        dense = torch.zeros(1, vocab)
+        dense[0, 0] = 5.0
+        dense[0, 1] = 4.0
+        scores = torch.arange(vocab, 0, -1, dtype=torch.float32).unsqueeze(0)
+        scores = scores.detach().clone().requires_grad_(True)
+        loss, metrics = cutoff_retrieval_loss(dense, scores, 8)
+        self.assertEqual(8, int(metrics["cutoff_index"][0].item()))
+        self.assertEqual(0.0, float(loss.detach()))
+        loss.backward()
+        self.assertTrue(torch.all(scores.grad == 0))
+
+    def test_positive_below_cutoff_trains_factors_and_pushes_tau_down(self):
+        model = LlamaForCausalLMEagle4(
+            _config(
+                efficient_lm_head_config={
+                    "type": "low_rank",
+                    "rank": 4,
+                    "num_candidates": 8,
+                }
+            ),
+            attention_backend="sdpa",
+        )
+        model.freeze_non_candidate_parameters()
+        hidden = torch.zeros(1, 1, 8)
+        hidden[..., 0] = 1.0
+        with torch.no_grad():
+            model.norm.weight.fill_(1.0)
+            model.lm_head.weight.zero_()
+            model.lm_head.weight[0, 0] = 8.0
+            model.lm_head.weight[1, 0] = 7.0
+            model.efficient_lm_head_down_proj.weight.zero_()
+            model.efficient_lm_head_down_proj.weight[0, 0] = 1.0
+            model.efficient_lm_head.weight.zero_()
+            ranking = torch.tensor(
+                [2, 3, 4, 5, 6, 7, 8, 0, 9, 10, 11, 12, 13, 14, 15, 1]
+            )
+            model.efficient_lm_head.weight[ranking, 0] = torch.arange(
+                16, 0, -1, dtype=torch.float32
+            )
+        hidden_n = model.norm(hidden)
+        scores_before = torch.nn.functional.linear(
+            torch.nn.functional.linear(
+                hidden_n, model.efficient_lm_head_down_proj.weight
+            ),
+            model.efficient_lm_head.weight,
+        ).detach()
+        loss, metrics = model.retrieval_loss(hidden)
+        tau = int(metrics["cutoff_index"][0].item())
+        self.assertEqual(8, tau)
+        self.assertGreater(float(loss.detach()), 0.0)
+        loss.backward()
+        self.assertIsNotNone(model.efficient_lm_head.weight.grad)
+        self.assertIsNotNone(model.efficient_lm_head_down_proj.weight.grad)
+        self.assertIsNone(model.lm_head.weight.grad)
+        self.assertGreater(model.efficient_lm_head.weight.grad[tau, 0].item(), 0.0)
+
+        lr = 0.5
+        with torch.no_grad():
+            model.efficient_lm_head.weight -= lr * model.efficient_lm_head.weight.grad
+            model.efficient_lm_head_down_proj.weight -= (
+                lr * model.efficient_lm_head_down_proj.weight.grad
+            )
+        scores_after = torch.nn.functional.linear(
+            torch.nn.functional.linear(
+                model.norm(hidden), model.efficient_lm_head_down_proj.weight
+            ),
+            model.efficient_lm_head.weight,
+        ).detach()
+        self.assertLess(scores_after[0, 0, tau].item(), scores_before[0, 0, tau].item())
+
+    def test_candidate_head_requires_a_dense_checkpoint(self):
+        from types import SimpleNamespace
+
+        from specforge.algorithms.model_providers import build_eagle4_draft
+
+        cfg = SimpleNamespace(
+            model=SimpleNamespace(
+                vocab_mapping_path="",
+                draft_checkpoint_path=None,
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "draft_checkpoint_path"):
+            build_eagle4_draft(
+                cfg,
+                _config(
+                    efficient_lm_head_config={
+                        "type": "low_rank",
+                        "rank": 4,
+                        "num_candidates": 8,
+                    }
+                ),
+            )
+
+    def test_candidate_head_accepts_identity_mapping_and_rejects_shrink(self):
+        from types import SimpleNamespace
+
+        from specforge.algorithms.model_providers import build_eagle4_draft
+
+        config = _config(
+            efficient_lm_head_config={
+                "type": "low_rank",
+                "rank": 4,
+                "num_candidates": 8,
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = os.path.join(tmp, "identity.pt")
+            torch.save(
+                {
+                    "d2t": torch.zeros(16, dtype=torch.int64),
+                    "t2d": torch.ones(16, dtype=torch.bool),
+                },
+                identity,
+            )
+            shrinking = os.path.join(tmp, "shrink.pt")
+            t2d = torch.ones(16, dtype=torch.bool)
+            t2d[-1] = False
+            torch.save(
+                {
+                    "d2t": torch.zeros(16, dtype=torch.int64),
+                    "t2d": t2d,
+                },
+                shrinking,
+            )
+
+            def _cfg(mapping):
+                return SimpleNamespace(
+                    model=SimpleNamespace(
+                        vocab_mapping_path=mapping,
+                        draft_checkpoint_path=os.path.join(tmp, "ckpt"),
+                        torch_dtype="float32",
+                        load_target_embedding=False,
+                        cache_dir=tmp,
+                        trust_remote_code=False,
+                    ),
+                    training=SimpleNamespace(
+                        attention_backend="sdpa",
+                        strategy="eagle4",
+                    ),
+                )
+
+            report = SimpleNamespace(
+                missing_keys={"efficient_lm_head.weight"}
+            )
+            with mock.patch(
+                "specforge.algorithms.model_providers._warm_start",
+                return_value=report,
+            ), mock.patch(
+                "specforge.algorithms.model_providers._device",
+                return_value=torch.device("cpu"),
+            ):
+                model = build_eagle4_draft(_cfg(identity), config)
+                self.assertTrue(bool(model.t2d.all().item()))
+                trainable = {
+                    name
+                    for name, param in model.named_parameters()
+                    if param.requires_grad
+                }
+                self.assertEqual(
+                    {
+                        "efficient_lm_head.weight",
+                        "efficient_lm_head_down_proj.weight",
+                    },
+                    trainable,
+                )
+                with self.assertRaisesRegex(ValueError, "identity"):
+                    build_eagle4_draft(_cfg(shrinking), config)
+
 
 @unittest.skipUnless(
     OnlineEagle3Model is not None, "OnlineEagle3Model imports require triton"
 )
 class Eagle4TTTHookTest(unittest.TestCase):
-    def test_ttt_uses_next_depth_hidden_and_identity_vocab_without_t2d(self):
+    def test_ttt_uses_next_depth_hidden_and_identity_vocab(self):
         model = LlamaForCausalLMEagle4(
             _config(
                 efficient_lm_head_config={
@@ -442,7 +668,7 @@ class Eagle4TTTHookTest(unittest.TestCase):
             ),
             attention_backend="sdpa",
         ).eval()
-        self.assertFalse(hasattr(model, "t2d"))
+        self.assertTrue(bool(model.t2d.all().item()))
         wrapper = OnlineEagle3Model(model, length=1, attention_backend="sdpa")
         batch, seq, hidden, vocab = 1, 4, 8, 16
         with mock.patch.object(
@@ -459,6 +685,8 @@ class Eagle4TTTHookTest(unittest.TestCase):
         self.assertEqual(1, len(plosses))
         self.assertTrue(torch.isfinite(plosses[0]))
         self.assertIsNotNone(wrapper.last_candidate_recall)
+        self.assertIsNotNone(wrapper.last_retrieval_hit_1)
+        self.assertEqual("retrieval_loss", wrapper.objective_metric_name)
 
 
 if __name__ == "__main__":

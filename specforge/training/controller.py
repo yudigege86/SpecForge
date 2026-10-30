@@ -553,12 +553,20 @@ class TrainerCore:
         eagle3_model = getattr(self.strategy, "eagle3_model", None)
         if eagle3_model is not None and not hasattr(eagle3_model, "lk_loss_type"):
             eagle3_model = getattr(eagle3_model, "module", eagle3_model)
-        objective_metric_name = (
-            "lk_loss"
-            if eagle3_model is not None
-            and getattr(eagle3_model, "lk_loss_type", None) is not None
-            else "kl_loss"
+        named_objective = (
+            None
+            if eagle3_model is None
+            else getattr(eagle3_model, "objective_metric_name", None)
         )
+        if named_objective:
+            objective_metric_name = named_objective
+        elif (
+            eagle3_model is not None
+            and getattr(eagle3_model, "lk_loss_type", None) is not None
+        ):
+            objective_metric_name = "lk_loss"
+        else:
+            objective_metric_name = "kl_loss"
         structured = _reduce_eagle3_metrics(
             out.metrics,
             device=metric_device,
