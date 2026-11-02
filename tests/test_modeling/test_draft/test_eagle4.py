@@ -26,8 +26,6 @@ from specforge.modeling.draft.eagle4 import (
 )
 from specforge.modeling.draft.eagle4_moe import (
     Eagle4MoE,
-    _expert_mlp,
-    _grouped_mm_fn,
     relu2,
     resolve_act_fn,
 )
@@ -172,10 +170,15 @@ class Eagle4FusionTest(unittest.TestCase):
                     self.assertFalse(torch.allclose(residual, attention_input))
                 # Zero attention and MLP isolate the skip connection, while
                 # recording the input verifies normalization still feeds QKV.
-                with mock.patch.object(
-                    layer.self_attn, "forward", return_value=torch.zeros_like(hidden)
-                ) as attention, mock.patch.object(
-                    layer.mlp, "forward", side_effect=torch.zeros_like
+                with (
+                    mock.patch.object(
+                        layer.self_attn,
+                        "forward",
+                        return_value=torch.zeros_like(hidden),
+                    ) as attention,
+                    mock.patch.object(
+                        layer.mlp, "forward", side_effect=torch.zeros_like
+                    ),
                 ):
                     output = layer(input_emb=embeds, hidden_states=hidden)
                 torch.testing.assert_close(output, residual)
@@ -200,7 +203,9 @@ class Eagle4FusionTest(unittest.TestCase):
         torch.testing.assert_close(logits, model.lm_head(model.norm(raw)))
 
     def test_no_rope_is_identity_rotation(self):
-        model = LlamaForCausalLMEagle4(_config(use_rope=False), attention_backend="sdpa")
+        model = LlamaForCausalLMEagle4(
+            _config(use_rope=False), attention_backend="sdpa"
+        )
         rotary = model.midlayer.self_attn.rotary_emb
         self.assertIsInstance(rotary, NoRotaryEmbedding)
         query = torch.randn(1, 2, 4, 4)
@@ -223,13 +228,23 @@ class Eagle4FusionTest(unittest.TestCase):
         self.assertLess(mask[0, 0, 5, 1].item(), 0.0)
         self.assertLess(mask[0, 0, 5, 2].item(), 0.0)
 
+        cached = _make_causal_mask(
+            (1, 1),
+            torch.float32,
+            torch.device("cpu"),
+            past_key_values_length=5,
+            window=3,
+        )
+        torch.testing.assert_close(
+            cached[0, 0, 0] == 0,
+            torch.tensor([False, False, False, True, True, True]),
+        )
+
         model = LlamaForCausalLMEagle4(
             _config(sliding_window=3), attention_backend="sdpa"
         )
         hidden = torch.ones(1, 6, 8)
-        attn = model.prepare_decoder_attention_mask(
-            torch.ones(1, 6), hidden, 1, 6, 0
-        )
+        attn = model.prepare_decoder_attention_mask(torch.ones(1, 6), hidden, 1, 6, 0)
         self.assertLess(attn[0, 0, 5, 1].item(), 0.0)
         self.assertEqual(0.0, attn[0, 0, 5, 4].item())
 
@@ -325,35 +340,36 @@ class Eagle4MoETest(unittest.TestCase):
         self.assertEqual((2, 4, 8), tuple(out.shape))
         self.assertTrue(torch.isfinite(out).all())
 
-    def test_grouped_mm_is_skipped_on_hip(self):
-        h = mock.Mock()
-        h.is_cuda = True
-        h.device.type = "cuda"
-        with mock.patch(
-            "specforge.modeling.draft.eagle4_moe.F.grouped_mm",
-            mock.Mock(),
-            create=True,
-        ), mock.patch(
-            "specforge.modeling.draft.eagle4_moe.torch.version.hip",
-            "6.4",
-        ):
-            self.assertIsNone(_grouped_mm_fn(h))
+class Eagle4DenseHeadTest(unittest.TestCase):
+    def test_dense_export_roundtrip_preserves_identity_mapping(self):
+        model = LlamaForCausalLMEagle4(_config(), attention_backend="sdpa")
+        hidden = torch.randn(1, 3, 8)
+        torch.testing.assert_close(
+            model.compute_logits(hidden), model.lm_head(model.norm(hidden))
+        )
+        self.assertTrue(bool(model.t2d.all()))
+        self.assertTrue(bool((model.d2t == 0).all()))
+        self.assertFalse(any("efficient_lm_head" in k for k in model.state_dict()))
+        with tempfile.TemporaryDirectory() as directory:
+            model.save_pretrained(directory)
+            reloaded = AutoDraftModel.from_pretrained(directory, local_files_only=True)
+            torch.testing.assert_close(
+                model.compute_logits(hidden), reloaded.compute_logits(hidden)
+            )
 
-    def test_expert_mlp_falls_back_when_grouped_mm_raises(self):
-        h = torch.randn(4, 4)
-        idx = torch.tensor([[0], [1], [0], [1]])
-        weights = torch.ones(4, 1)
-        up = torch.randn(2, 8, 4)
-        down = torch.randn(2, 4, 8)
-        expected = _expert_mlp(h, idx, weights, up, down, True, relu2)
-        grouped = mock.Mock(side_effect=RuntimeError("no grouped_mm"))
-        with mock.patch(
-            "specforge.modeling.draft.eagle4_moe._grouped_mm_fn",
-            return_value=grouped,
-        ):
-            out = _expert_mlp(h, idx, weights, up, down, True, relu2)
-        torch.testing.assert_close(out, expected)
-        grouped.assert_called()
+    def test_forward_returns_raw_hidden_for_single_logit_normalization(self):
+        model = LlamaForCausalLMEagle4(
+            _config(norm_output=True), attention_backend="sdpa"
+        )
+        hidden, embeds = _inputs()
+        raw = torch.randn(2, 4, 8)
+        with mock.patch.object(model, "backbone", return_value=raw):
+            output = model(hidden_states=hidden, inputs_embeds=embeds)
+        torch.testing.assert_close(output, raw)
+        torch.testing.assert_close(
+            model.compute_logits(output), model.lm_head(model.norm(raw))
+        )
+        torch.testing.assert_close(model.next_depth_hidden(output), model.norm(raw))
 
 
 class Eagle4CandidateHeadTest(unittest.TestCase):
@@ -614,7 +630,7 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
                 ),
             )
 
-    def test_candidate_head_accepts_identity_mapping_and_rejects_shrink(self):
+    def test_candidate_head_creates_identity_mapping_and_rejects_external_map(self):
         from types import SimpleNamespace
 
         from specforge.algorithms.model_providers import build_eagle4_draft
@@ -672,7 +688,7 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
                 "specforge.algorithms.model_providers._device",
                 return_value=torch.device("cpu"),
             ):
-                model = build_eagle4_draft(_cfg(identity), config)
+                model = build_eagle4_draft(_cfg(""), config)
                 self.assertTrue(bool(model.t2d.all().item()))
                 trainable = {
                     name
@@ -686,7 +702,7 @@ class Eagle4RetrievalLossTest(unittest.TestCase):
                     },
                     trainable,
                 )
-                with self.assertRaisesRegex(ValueError, "identity"):
+                with self.assertRaisesRegex(ValueError, "omit model.vocab_mapping_path"):
                     build_eagle4_draft(_cfg(shrinking), config)
 
 
@@ -725,6 +741,50 @@ class Eagle4TTTHookTest(unittest.TestCase):
         self.assertIsNotNone(wrapper.last_candidate_recall)
         self.assertIsNotNone(wrapper.last_retrieval_hit_1)
         self.assertEqual("retrieval_loss", wrapper.objective_metric_name)
+
+
+@unittest.skipUnless(
+    OnlineEagle3Model is not None, "OnlineEagle3Model imports require triton"
+)
+class Eagle4DenseTTTHookTest(unittest.TestCase):
+    def test_dense_ttt_uses_next_depth_hidden_and_backpropagates(self):
+        model = LlamaForCausalLMEagle4(
+            _config(attn_norm=True, norm_output=True), attention_backend="sdpa"
+        )
+        wrapper = OnlineEagle3Model(model, length=2, attention_backend="sdpa")
+
+        def reference_loss(logits, target_p, mask, target_on_draft=None):
+            # Exercise the TTT plumbing on CPU; the fused kernel has separate tests.
+            loss = -(mask * target_p * logits.float().log_softmax(-1)).sum(-1).mean()
+            if target_on_draft is None:
+                return loss
+            rows = torch.minimum(logits.float().softmax(-1), target_on_draft).sum(-1)
+            return loss, rows
+
+        with (
+            mock.patch.object(
+                model, "next_depth_hidden", wraps=model.next_depth_hidden
+            ) as next_depth,
+            mock.patch(
+                "specforge.algorithms.eagle3.model.LogSoftmaxLoss.apply",
+                side_effect=reference_loss,
+            ),
+        ):
+            plosses, *_ = wrapper(
+                input_ids=torch.ones(1, 4, dtype=torch.long),
+                attention_mask=torch.ones(1, 4),
+                target=torch.randn(1, 4, 16),
+                loss_mask=torch.ones(1, 4, 1),
+                hidden_states=torch.randn(1, 4, 24),
+            )
+            loss = sum(plosses)
+            loss.backward()
+        self.assertEqual(next_depth.call_count, 2)
+        self.assertEqual(len(plosses), 2)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(model.lm_head.weight.grad).all())
+        self.assertTrue(torch.isfinite(model.midlayer.eh_proj.weight.grad).all())
+
 
 
 if __name__ == "__main__":

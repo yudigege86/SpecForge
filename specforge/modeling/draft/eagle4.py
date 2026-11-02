@@ -155,8 +155,12 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
         if EAGLE4_ARCH not in architectures:
             config.architectures = [EAGLE4_ARCH]
 
+        if config.num_hidden_layers != 1:
+            raise ValueError("EAGLE-4 supports one draft layer")
         self.vocab_size = config.vocab_size
         self.draft_vocab_size = getattr(config, "draft_vocab_size", None) or config.vocab_size
+        if self.draft_vocab_size != self.vocab_size:
+            raise ValueError("EAGLE-4 uses a full-vocab head; require draft_vocab_size == vocab_size")
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
@@ -412,7 +416,7 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
             past_key_values=None,
             use_cache=False,
         )
-        return self.next_depth_hidden(hidden_states)
+        return hidden_states
 
 
 __all__ = ["LlamaForCausalLMEagle4", "candidate_logits", "cutoff_retrieval_loss"]

@@ -105,6 +105,9 @@ def build_eagle4_draft(cfg: Config, draft_config: PretrainedConfig):
     from specforge.modeling.auto import AutoDraftModel
     from specforge.modeling.draft.eagle4_structure import parse_efficient_lm_head_config
 
+    if cfg.model.vocab_mapping_path:
+        raise ValueError("EAGLE-4 uses the full vocabulary; omit model.vocab_mapping_path")
+
     if parse_efficient_lm_head_config(draft_config) is not None:
         if not cfg.model.draft_checkpoint_path:
             raise ValueError(
@@ -528,6 +531,25 @@ def build_dspark_model(
     )
 
 
+def build_dspine_model(
+    cfg: Config,
+    draft_model: Any,
+    _draft_config: Any,
+    _target_config: Any,
+    tokenizer: Any,
+) -> AlgorithmModelParts:
+    from specforge.algorithms.dspine.model import OnlineDSpineModel
+
+    return _build_dflash_family_model(
+        cfg,
+        draft_model,
+        tokenizer,
+        lambda common: OnlineDSpineModel(
+            **common, fused_logits_loss=cfg.training.fused_logits_loss
+        ),
+    )
+
+
 def eagle3_strategy_kwargs(cfg: Config) -> Dict[str, Any]:
     return {
         "trim_loss_positions": cfg.training.trim_loss_positions,
@@ -611,6 +633,7 @@ __all__ = [
     "build_dflash_model",
     "build_domino_model",
     "build_dspark_model",
+    "build_dspine_model",
     "build_eagle3_draft",
     "build_eagle3_model",
     "build_eagle4_draft",

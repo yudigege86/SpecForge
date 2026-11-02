@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,6 +43,10 @@ class StepOutput:
     # Additive telemetry (for example reached/accepted counts), summed across
     # the optimizer window and data-parallel ranks, never averaged.
     sum_metrics: Dict[str, Any] = field(default_factory=dict)
+    # Replay a graph-free prepass once the window's local ratio totals are known.
+    replay_loss: Optional[
+        Callable[[Dict[str, Tuple[torch.Tensor, torch.Tensor]]], StepOutput]
+    ] = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,7 @@ class StepContext:
     global_step: int = 0
     total_steps: Optional[int] = None
     collect_detailed_metrics: bool = True
+    accumulation_steps: int = 1
 
 
 def linear_lambda_base(
@@ -236,28 +241,22 @@ class Eagle3TrainStrategy(DraftTrainStrategy):
                 getattr(getattr(self.target_head, "config", None), "vocab_size", 0)
             )
         )
-        t2d = getattr(draft_model, "t2d", None)
-        d2t = getattr(draft_model, "d2t", None)
-        if t2d is None or d2t is None:
-            vocab = int(draft_model.vocab_size)
-            t2d = torch.ones(vocab, dtype=torch.bool)
-            d2t = torch.zeros(vocab, dtype=torch.int64)
         draft_vocab_size = int(
             getattr(
                 getattr(draft_model, "config", None),
                 "draft_vocab_size",
-                int(t2d.sum().item()),
+                int(draft_model.t2d.sum().item()),
             )
         )
         validate_compact_teacher_enabled(
             is_online=False,
             draft_vocab_size=draft_vocab_size,
             vocab_size=vocab_size,
-            t2d=t2d,
+            t2d=draft_model.t2d,
             target_head_weight=target_head_weight,
             chunk_size=self.compact_teacher_chunk_size,
         )
-        validate_vocab_mapping_consistency(t2d, d2t)
+        validate_vocab_mapping_consistency(draft_model.t2d, draft_model.d2t)
 
     def trainable_module(self) -> nn.Module:
         return self.eagle3_model

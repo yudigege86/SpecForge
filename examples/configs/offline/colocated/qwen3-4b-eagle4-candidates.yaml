@@ -1,10 +1,10 @@
-# Qwen3-4B EAGLE-4 stage-2 candidate head, offline — AMD ROCm.
+# Qwen3-4B EAGLE-4 stage-2 candidate head, offline.
 #
 # Train only the low-rank factors A, B from a dense stage-1 export. Point
 # model.draft_checkpoint_path at that export (a SpecForge checkpoint directory
 # or a HuggingFace draft folder). Capture is the same as stage 1.
 #
-#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-candidates-amd.yaml
+#   specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-candidates.yaml
 model:
   target_model_path: "Qwen/Qwen3-4B"
   draft_model_config: "configs/qwen3-4b-eagle4-candidates.json"

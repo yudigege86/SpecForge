@@ -3,18 +3,15 @@
 # SpecForge has no online colocated topology. This managed-local recipe is the
 # same-node path: one `specforge train` owns Mooncake, the SGLang capture
 # server (GPU 0), and seven trainer ranks (GPUs 1-7). Capture method is eagle3
-# (EAGLE-4 reuses that aux layout). Requires the v0.5.18 spec-capture patch,
-# not a Muse Spark image.
+# (EAGLE-4 reuses that auxiliary layout). Requires streaming capture support.
 #
-#   specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-candidates-amd.yaml
+#   specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-candidates.yaml
 #
 # Stage 2 trains only the low-rank factors A, B from a dense stage-1 export.
 # Point model.draft_checkpoint_path at that export. Do not use
 # training.resume_from.
 #
-# Disaggregated online still requires a shared model.vocab_mapping_path; pass
-# an identity mapping (d2t=zeros(V), t2d=ones(V, dtype=bool)) so producer and
-# consumer share the default full-vocab buffers. Do not pass a shrinking map.
+# Full-vocabulary identity buffers are created internally; omit vocab_mapping_path.
 model:
   target_model_path: "Qwen/Qwen3-4B"
   draft_model_config: "configs/qwen3-4b-eagle4-candidates.json"
@@ -23,7 +20,6 @@ model:
   embedding_key: "model.embed_tokens.weight"
   torch_dtype: "bfloat16"
   use_liger_kernel: false
-  sglang_attention_backend: "aiter"
   sglang_mem_fraction_static: 0.5
   sglang_context_length: 4096
   sglang_disable_radix_cache: true
@@ -78,8 +74,3 @@ deployment:
             - "0"
           tp_size: 1
           mem_fraction_static: 0.5
-          attention_backend: aiter
-          env:
-            SGLANG_USE_AITER: "1"
-            SGLANG_USE_AITER_UNIFIED_ATTN: "1"
-            AITER_FLYDSL_FORCE: "1"

@@ -27,7 +27,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -335,7 +335,7 @@ def preflight_draft_kernels(
         cfg.model.use_liger_kernel is False
         or (
             cfg.model.use_liger_kernel is None
-            and cfg.training.strategy in ("domino", "dspark")
+            and cfg.training.strategy in ("domino", "dspark", "dspine")
         )
         or not algorithm.spec.capabilities.supports_liger_kernel
     ):
