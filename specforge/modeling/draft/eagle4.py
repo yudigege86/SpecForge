@@ -19,7 +19,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 
 from specforge.modeling._mask_utils import prepare_decoder_attention_mask
 from specforge.modeling.draft.base import Eagle3DraftModel
-from specforge.modeling.draft.eagle4_moe import update_eagle4_router_bias
+from specforge.modeling.draft.eagle4_moe import Eagle4Router, update_eagle4_router_bias
 from specforge.modeling.draft.eagle4_structure import (
     EAGLE4_ARCH,
     draft_sliding_window,
@@ -295,6 +295,11 @@ class LlamaForCausalLMEagle4(Eagle3DraftModel):
             )
         for name, param in self.named_parameters():
             param.requires_grad = name in _CANDIDATE_HEAD_PARAM_NAMES
+        # Router load balancing mutates buffers independently of autograd.
+        for module in self.modules():
+            if isinstance(module, Eagle4Router):
+                module.bias_updates_enabled = False
+                module.load.zero_()
 
     def retrieval_loss(
         self,

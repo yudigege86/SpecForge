@@ -309,6 +309,37 @@ class Eagle4MoETest(unittest.TestCase):
         self.assertFalse(torch.equal(before, router.e_score_correction_bias))
         self.assertEqual(0, int(router.load.sum().item()))
 
+    def test_candidate_freeze_preserves_router_buffers_in_train_mode(self):
+        model = LlamaForCausalLMEagle4(
+            self._moe_config(
+                efficient_lm_head_config={
+                    "type": "low_rank",
+                    "rank": 4,
+                    "num_candidates": 3,
+                }
+            ),
+            attention_backend="sdpa",
+        )
+        router = model.midlayer.mlp.gate
+        router.load.copy_(torch.tensor([8, 0]))
+        model.freeze_non_candidate_parameters()
+        self.assertEqual(0, int(router.load.sum()))
+        before = {k: v.clone() for k, v in model.state_dict().items()}
+        model.train()  # Training the retrieval head must not reactivate the router.
+        hidden, embeds = _inputs()
+        model(hidden_states=hidden, inputs_embeds=embeds)
+        self.assertEqual(0, int(router.load.sum()))
+        # Even stale counts must not trigger a collective or mutate the bias.
+        router.load.copy_(torch.tensor([8, 0]))
+        with mock.patch(
+            "specforge.modeling.draft.eagle4_moe.dist.all_reduce"
+        ) as reduce:
+            self.assertIsNone(model.update_moe_router_bias())
+            reduce.assert_not_called()
+        self.assertEqual(0, int(router.load.sum()))
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
     def test_enable_moe_requires_experts(self):
         with self.assertRaisesRegex(ValueError, "n_routed_experts"):
             LlamaForCausalLMEagle4(_config(enable_moe=True), attention_backend="sdpa")

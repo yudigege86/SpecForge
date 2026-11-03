@@ -49,6 +49,7 @@ class Eagle4Router(nn.Module):
                 torch.empty(n, config.hidden_size), std=config.initializer_range
             )
         )
+        self.bias_updates_enabled = True
         self.register_buffer("e_score_correction_bias", torch.zeros(n))
         self.register_buffer("load", torch.zeros(n, dtype=torch.long), persistent=False)
         self.update_rate = getattr(
@@ -63,8 +64,12 @@ class Eagle4Router(nn.Module):
         return self
 
     @torch.no_grad()
-    def update_bias(self) -> float:
+    def update_bias(self) -> Optional[float]:
         """Called once per optimizer step; returns max / mean expert load."""
+
+        if not self.bias_updates_enabled:
+            self.load.zero_()
+            return None
 
         load = self.load.float()
         if dist.is_available() and dist.is_initialized():
@@ -158,7 +163,7 @@ class Eagle4MoE(nn.Module):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         idx, weights = self.route(x)
         counts = torch.bincount(idx.flatten(), minlength=self.gate.weight.shape[0])
-        if self.training:
+        if self.training and self.gate.bias_updates_enabled:
             self.gate.load += counts.to(device=self.gate.load.device)
         h = self.fc1_latent_proj(x) if self.latent else x
         up, down = (self.experts[name] for name in self.expert_names)
