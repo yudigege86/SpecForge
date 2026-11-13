@@ -1,4 +1,4 @@
-# EAGLE-4 stage-1 training
+# EAGLE-4 training
 
 Stage 1 trains a dense, full-vocabulary draft head. Candidate-factor training and
 SVD conversion are described separately below for the stage-2 branch. For stage 1, do not set
@@ -32,51 +32,152 @@ specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4.yaml
 ```
 
 The offline example captures 256 training samples and runs 20 optimizer steps.
-It is neither the one-epoch training run nor the held-out evaluation described
-below. Runtime attention kernels are selected by the installed capture backend;
+Runtime attention kernels are selected by the installed capture backend;
 these recipes do not force a hardware-specific kernel.
-
-## Historical validation and recipe alignment
-
-The archived stage-1 run used the same architecture JSON, one capture GPU and
-seven trainer ranks, one ShareGPT epoch, sequence length 2,048, TTT length 7,
-batch size 1 per rank, learning rate 0.0001, gradient clipping 0.5, and seed 0.
-It completed 16,947 optimizer steps. Its capture configuration explicitly selected
-a runtime-specific attention kernel; the current recipe leaves that selection
-to the runtime. The old online setup required an external identity vocabulary
-mapping; the current implementation creates that mapping internally.
-
-The historical checkpoint predates the correction of the fusion residual to
-`z + attention(norm(z))`. No full training run with the corrected residual has
-been completed. Its training and evaluation metrics therefore describe that
-historical checkpoint, not a fresh execution of the current recipe.
-
-Teacher-forced offline evaluation used a separate set of 256 held-out
-conversations, excluded from training by ID and message fingerprint, with sequence
-length 2,048 and TTT length 7. A rank-128 SVD conversion retrieving 128 candidates
-was evaluated separately; its metrics do not measure the trained stage-2 head.
-
-Serving validation was a separate integration smoke test using the existing dense
-checkpoint and its SVD conversion with the corrected inference residual. It used
-SGLang with static EAGLE-Harness scheduling, BF16, one GPU, tensor parallelism 1,
-concurrency 1, eager execution, three draft steps, top-k 1, and four draft tokens.
-Decoding was greedy with thinking disabled and a 256-token output limit. All 33
-prompts (32 held-out first-user-turn prompts and one long-context prompt) were
-warmed up before timing. Dense serving completed 33/33 requests at 88.03 output
-tokens/s and 1.862 tokens per verification round; SVD serving completed 33/33 at
-86.17 tokens/s and 1.839 tokens per round. Acceptance includes the bonus token.
-
-The training YAML files do not configure this serving protocol. These results
-are smoke-test evidence, not an optimized benchmark, exact target-only output
-equivalence check, or an end-to-end rerun of the revised recipes.
 
 ## Stage-2 candidate training
 
-This branch additionally supports `configs/qwen3-4b-eagle4-candidates.json` and
-the `qwen3-4b-eagle4-candidates.yaml` online and offline recipes alongside the
-stage-1 recipes. Set `model.draft_checkpoint_path` to a dense stage-1 export.
-Only the low-rank factors are trainable; the dense drafter remains frozen.
-Missing factor weights are initialized from the dense head with SVD. The objective
-is cutoff retrieval loss. Full-vocabulary identity buffers are created internally,
-so these recipes also omit `model.vocab_mapping_path`. The historical serving
-results above describe the untrained SVD conversion, not the trained stage-2 head.
+Stage 2 trains a small head to retrieve vocabulary candidates for a frozen
+stage-1 drafter. The full vocabulary head remains the scoring head: the low-rank
+head selects which tokens to score, and the corresponding rows of the full head
+provide their logits. Training therefore optimizes candidate coverage rather
+than requiring the low-rank scores to reproduce every full-head logit.
+
+### Head structure and initialization
+
+For vocabulary size `V`, draft hidden size `H`, rank `r`, and candidate budget `C`,
+the model keeps three weight matrices:
+
+- `W = lm_head.weight`, shape `[V, H]`: the frozen full vocabulary head.
+- `A = efficient_lm_head.weight`, shape `[V, r]`: the trainable vocabulary factor.
+- `B = efficient_lm_head_down_proj.weight`, shape `[r, H]`: the trainable down projection.
+
+For a normalized draft hidden vector `h`, the full-head logits are `z = W h`
+and the retrieval scores are `s = A (B h)`. At inference, the top `C` entries of
+`s` select candidates; their exact logits are computed using the selected rows
+of `W`. The dense head must be retained in the checkpoint.
+
+With `type: low_rank`, missing factor weights are initialized from the dense
+head using an FP32 truncated SVD: `W ≈ U_r Σ_r V_r^T`, with
+`A = U_r Σ_r` and `B = V_r^T`. Factors are copied into the model's parameter
+dtype. If either factor is missing during warm start, both are SVD-initialized;
+if both are present, their loaded values are preserved. SVD supplies an initial
+matrix approximation; subsequent training specializes the factors for retrieval.
+
+### Frozen drafter and training flow
+
+Only `A` and `B` receive parameter updates. Embeddings, feature projection,
+normalization layers, attention, MoE experts and router parameters, and the full
+head remain frozen. Router load-balancing bias updates are explicitly disabled:
+freezing parameters alone would not prevent this buffer from changing.
+
+Stage 2 uses the same target-feature capture and token/loss-mask format as stage 1.
+Offline training reads previously captured target features; online training
+receives them from the capture service. At each training-time rollout (TTT) depth:
+
+1. Run the frozen drafter using target features initially and draft hidden-state
+   feedback at subsequent depths, with the training sequence's shifted token inputs.
+2. Detach the draft hidden states, apply the frozen output normalization, and
+   compute both `z` and `s` on the same hidden states.
+3. Use the frozen drafter's full head to choose and weight positive vocabulary
+   tokens, then compute the cutoff retrieval loss below.
+4. Apply the supervision mask and backpropagate into `A` and `B` only.
+
+The full-head teacher here is the **drafter's** `W`, not the target model's LM
+head. This is a teacher-forced training rollout, not an online acceptance-length
+measurement. Logit normalization and next-depth hidden-state feedback remain
+separate; feedback follows the drafter's `norm_output` configuration.
+Per-depth masked losses are summed with equal weights for this retrieval
+objective, rather than the usual EAGLE depth decay.
+
+### Cutoff retrieval loss
+
+For each supervised hidden state, let `P` be the top `m` tokens under the frozen
+full-head logits, where `m = min(32, floor(C / 4))`. Training requires
+`4 <= C < V`. With `C = 128`, there are 32 positives.
+
+For each positive token `i`, its weight is `p_i = softmax(z)_i` at temperature 1.
+These are probabilities normalized over the **full vocabulary**, not renormalized
+over the positive set. Exclude all positives from the retrieval scores, then
+choose the `(C - m + 1)`-th highest remaining score as the cutoff `tau`.
+For `C = 128`, this is the 97th highest non-positive score.
+
+The loss for one hidden state is:
+
+```text
+L(h) = sum over i in P:
+         p_i * 1[s_i <= tau] * softplus(tau - s_i)
+```
+
+The objective raises positives that fall at or below the candidate boundary and
+lowers the competing cutoff score. Positives already above the cutoff contribute
+zero. Putting all `m` positives strictly above this cutoff leaves at most `C - m`
+non-positive tokens ahead of them, placing the positives within the top `C`.
+
+Positive selection, probability weights, cutoff selection, and the comparison
+mask are stop-gradient. The **value** of the selected cutoff score still receives
+gradients, as do the positive scores. Each depth's loss is averaged over the
+supervised positions using `loss_mask`; padding and unsupervised positions do
+not contribute. Training computes full-vocabulary scores to define this loss;
+candidate-only dense scoring is the inference path.
+
+### Configuration and running
+
+On this branch, `training.strategy: eagle4` together with
+`efficient_lm_head_config` in the draft JSON selects candidate-factor training.
+For example:
+
+```json
+"efficient_lm_head_config": {
+  "type": "low_rank",
+  "rank": 128,
+  "num_candidates": 128
+}
+```
+
+Use [the candidate draft config](../configs/qwen3-4b-eagle4-candidates.json)
+with a compatible trained dense drafter. Keep `draft_vocab_size` equal to
+`vocab_size`, and omit `model.vocab_mapping_path`: full-vocabulary identity
+buffers are created internally. The architecture, vocabulary, and target feature
+layers must match the source checkpoint; adding the head configuration does not
+convert an incompatible drafter architecture.
+
+Set `model.draft_checkpoint_path` to the actual checkpoint/export directory
+containing the trained draft weights. The recipes contain example paths that
+must be adjusted to the available checkpoint and data:
+
+```bash
+# Offline: reuse stage-1-compatible captured target features.
+specforge train --config examples/configs/offline/colocated/qwen3-4b-eagle4-candidates.yaml
+
+# Online: capture target features while training the candidate factors.
+specforge train --config examples/configs/online/disaggregated/managed-local/qwen3-4b-eagle4-candidates.yaml
+```
+
+`model.draft_checkpoint_path` is a weights-only warm start: it does not restore
+optimizer/scheduler state, step counters, data position, or RNG state. It is
+different from `training.resume_from`, the full-resume setting; the two settings
+are mutually exclusive. Do not treat a weights-only restart as continuation of
+the same optimizer trajectory. Keep both learned factors, the frozen dense
+drafter, and the matching head configuration together for inference; applying
+SVD again would replace the learned retrieval factors.
+
+### Reading the metrics
+
+- `retrieval_hit_1`: fraction of supervised positions where the candidate set
+  contains the frozen full head's top-1 token.
+- `retrieval_hit_mean`: mean coverage of the full head's top-`m` positives.
+- `retrieval_mass`: full-head probability mass contained in the candidate set.
+- `eval/per_position_acc`: full-head top-1 retrieval coverage at each TTT depth;
+  `eval/avg_acc` reports position 0, despite its generic name.
+
+For this objective, the generic acceptance-rate fields use positive-set coverage,
+and `eval/simulated_acc_len` is derived from retrieval coverage. Neither is an
+observed speculative decoding acceptance length. Measure serving acceptance
+separately with the target verifier. These definitions also differ from checking
+whether a dataset's next token appears among the candidates.
+
+Implementation references: [head and loss](../specforge/modeling/draft/eagle4.py),
+[positive-count rule](../specforge/modeling/draft/eagle4_structure.py),
+[loading and freezing](../specforge/algorithms/model_providers.py), and
+[TTT loss integration](../specforge/algorithms/eagle3/model.py).
